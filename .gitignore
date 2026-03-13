@@ -1,2 +1,3 @@
-cmd/
+dashboard
+profiler
 profiler.db
