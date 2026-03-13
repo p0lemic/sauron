@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(textutil:*)",
+      "Bash(go mod:*)",
+      "Bash(go test:*)",
+      "Bash(go build:*)",
+      "Bash(go vet:*)",
+      "Bash(mkdir -p /Users/javier/Code/sauron/storage && go get modernc.org/sqlite 2>&1)",
+      "Bash(go get:*)",
+      "Bash(tr  :*)",
+      "Bash(python3:*)",
+      "Bash(pandoc:*)",
+      "Bash(awk NR>=200 && NR<=360:*)",
+      "Bash(awk NR>=140 && NR<=200:*)",
+      "Bash(awk NR>=360 && NR<=460:*)",
+      "Bash(cat:*)"
+    ]
+  }
+}

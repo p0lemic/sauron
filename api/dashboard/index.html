@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>API Profiler</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <header>
+    <div class="header-brand">
+      <div class="sigil">▸</div>
+      <h1><span>API</span> Profiler</h1>
+    </div>
+    <div class="header-right">
+      <span class="header-meta" id="header-host"></span>
+      <span id="alert-badge"></span>
+    </div>
+  </header>
+
+  <div class="timerange-bar" id="timerange-bar">
+    <div class="timerange-inner">
+      <span class="timerange-label">Range</span>
+      <div class="timerange-inputs">
+        <input type="datetime-local" id="tr-from" class="tr-input" title="From">
+        <span class="timerange-sep">→</span>
+        <input type="datetime-local" id="tr-to" class="tr-input" title="To (leave empty for now)">
+      </div>
+      <button class="tr-btn tr-apply" id="tr-apply">Apply</button>
+      <button class="tr-btn tr-live active" id="tr-live">⬤ Live</button>
+    </div>
+  </div>
+
+  <main>
+
+    <section id="summary">
+      <div class="section-header">
+        <span class="section-title"><span class="dot"></span>Overview</span>
+      </div>
+      <div class="section-body">
+        <div class="placeholder">loading summary…</div>
+      </div>
+    </section>
+
+    <section id="alerts" style="display:none">
+      <div class="section-header">
+        <span class="section-title"><span class="dot dot-danger"></span>Active Alerts</span>
+      </div>
+      <div class="section-body"></div>
+    </section>
+
+    <section id="endpoints">
+      <div class="section-header">
+        <span class="section-title"><span class="dot"></span>Endpoints</span>
+      </div>
+      <div class="section-body">
+        <div class="placeholder">loading endpoints…</div>
+      </div>
+    </section>
+
+  </main>
+
+  <div class="statusbar">
+    <div class="statusbar-item">
+      <span class="indicator"></span>
+      <span>connected</span>
+    </div>
+    <span>poll · 5s</span>
+    <span id="last-updated"></span>
+  </div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

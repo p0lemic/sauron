@@ -1,0 +1,31 @@
+# profiler.yaml.example — proxy sidecar
+# Copy to profiler.yaml and adjust values for your environment.
+# All fields are optional; CLI flags override any value set here.
+
+# URL base of the upstream API to proxy (required).
+upstream: http://localhost:3000
+
+# Port where API Profiler proxy listens (default: 8080).
+port: 8080
+
+# Timeout for upstream requests. Accepts Go duration syntax: 30s, 1m, 2m30s.
+timeout: 30s
+
+# Storage backend for metrics.
+# For local development share the same SQLite file with the dashboard.
+# For ECS/production point both proxy and dashboard at the same PostgreSQL instance.
+storage:
+  driver: sqlite                 # "sqlite" (default) | "postgres"
+  dsn: profiler.db               # file path for sqlite, connection string for postgres
+
+# Examples:
+#
+# Local dev (SQLite):
+#   storage:
+#     driver: sqlite
+#     dsn: ./profiler.db
+#
+# ECS / AWS (PostgreSQL):
+#   storage:
+#     driver: postgres
+#     dsn: "postgres://user:pass@rds-host.us-east-1.rds.amazonaws.com/profiler"
