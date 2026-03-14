@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -77,6 +78,70 @@ func TestFindByWindowEmpty(t *testing.T) {
 
 	now := time.Now().UTC()
 	recs, err := s.FindByWindow(now.Add(-time.Minute), now)
+	require.NoError(t, err)
+	assert.NotNil(t, recs)
+	assert.Len(t, recs, 0)
+}
+
+// TC-01: FindRecent returns records newest-first (DESC).
+func TestFindRecentOrderDesc(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	saveRecord(t, s, "GET", "/a", 200, now.Add(-30*time.Second), 10)
+	saveRecord(t, s, "GET", "/b", 200, now.Add(-10*time.Second), 20)
+	saveRecord(t, s, "GET", "/c", 200, now.Add(-5*time.Second), 30)
+
+	recs, err := s.FindRecent(now.Add(-60*time.Second), now.Add(time.Second), 10)
+	require.NoError(t, err)
+	require.Len(t, recs, 3)
+	assert.Equal(t, "/c", recs[0].Path)
+	assert.Equal(t, "/b", recs[1].Path)
+	assert.Equal(t, "/a", recs[2].Path)
+}
+
+// TC-02: FindRecent respects the limit.
+func TestFindRecentLimit(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	for i := 0; i < 10; i++ {
+		saveRecord(t, s, "GET", fmt.Sprintf("/r%d", i), 200, now.Add(-time.Duration(i)*time.Second), 1)
+	}
+
+	recs, err := s.FindRecent(now.Add(-60*time.Second), now.Add(time.Second), 3)
+	require.NoError(t, err)
+	assert.Len(t, recs, 3)
+}
+
+// TC-03: FindRecent respects the [from, to) range.
+func TestFindRecentRange(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	saveRecord(t, s, "GET", "/old", 200, now.Add(-3*time.Minute), 1)
+	saveRecord(t, s, "GET", "/in", 200, now.Add(-30*time.Second), 1)
+
+	recs, err := s.FindRecent(now.Add(-time.Minute), now.Add(time.Second), 10)
+	require.NoError(t, err)
+	require.Len(t, recs, 1)
+	assert.Equal(t, "/in", recs[0].Path)
+}
+
+// TC-04: FindRecent with no records returns empty (non-nil) slice.
+func TestFindRecentEmpty(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	now := time.Now().UTC()
+	recs, err := s.FindRecent(now.Add(-time.Minute), now, 10)
 	require.NoError(t, err)
 	assert.NotNil(t, recs)
 	assert.Len(t, recs, 0)

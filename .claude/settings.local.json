@@ -14,7 +14,10 @@
       "Bash(awk NR>=200 && NR<=360:*)",
       "Bash(awk NR>=140 && NR<=200:*)",
       "Bash(awk NR>=360 && NR<=460:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(sed:*)",
+      "Bash(echo no docx:*)",
+      "Bash(grep:*)"
     ]
   }
 }

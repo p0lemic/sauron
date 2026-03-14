@@ -11,6 +11,28 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// PathRule defines a custom path normalization rule.
+type PathRule struct {
+	Pattern     string
+	Replacement string
+}
+
+// HeaderRule defines one header manipulation applied to every proxied request.
+type HeaderRule struct {
+	Action string // "set" | "remove"
+	Header string // header name (canonicalized on use)
+	Value  string // used only for action "set"
+}
+
+// HealthCheckConfig configures the upstream health check probe.
+type HealthCheckConfig struct {
+	Enabled   bool
+	Path      string        // upstream path to ping (default: "/")
+	Interval  time.Duration // default: 10s
+	Timeout   time.Duration // default: 5s
+	Threshold int           // consecutive failures to mark as "down" (default: 3)
+}
+
 // Config is the resolved configuration after merging YAML and CLI flags.
 type Config struct {
 	Upstream      string
@@ -26,6 +48,12 @@ type Config struct {
 	WebhookURL       string
 	StorageDriver    string // "sqlite" (default) | "postgres"
 	StorageDSN       string // file path for sqlite, connection string for postgres
+	NormalizePaths   bool         // enable path normalization (default: true)
+	PathRules        []PathRule   // custom normalization rules, applied before built-ins
+	HeaderRules      []HeaderRule // header rewrite rules applied to every proxied request
+	HealthCheck             HealthCheckConfig
+	ErrorRateThreshold      float64 // percentage; 0 = disabled
+	ThroughputDropThreshold float64 // minimum RPS % of baseline; 0 = disabled
 }
 
 // Default returns a Config with all default values applied.
@@ -40,6 +68,7 @@ func Default() Config {
 		AnomalyThreshold: 3.0,
 		StorageDriver:    "sqlite",
 		StorageDSN:       "profiler.db",
+		NormalizePaths:   true,
 	}
 }
 
@@ -47,6 +76,25 @@ func Default() Config {
 type yamlStorage struct {
 	Driver string `yaml:"driver"`
 	DSN    string `yaml:"dsn"`
+}
+
+type yamlPathRule struct {
+	Pattern     string `yaml:"pattern"`
+	Replacement string `yaml:"replacement"`
+}
+
+type yamlHeaderRule struct {
+	Action string `yaml:"action"`
+	Header string `yaml:"header"`
+	Value  string `yaml:"value"`
+}
+
+type yamlHealthCheck struct {
+	Enabled   bool   `yaml:"enabled"`
+	Path      string `yaml:"path"`
+	Interval  string `yaml:"interval"`
+	Timeout   string `yaml:"timeout"`
+	Threshold int    `yaml:"threshold"`
 }
 
 // yamlFile is the raw on-disk structure; durations are strings for flexible parsing.
@@ -57,12 +105,18 @@ type yamlFile struct {
 	DBPath        string `yaml:"db_path"`
 	Retention     string `yaml:"retention"`
 	TLSSkipVerify bool   `yaml:"tls_skip_verify"`
-	APIAddr          string      `yaml:"api_addr"`
-	MetricsWindow    string      `yaml:"metrics_window"`
-	BaselineWindows  int         `yaml:"baseline_windows"`
-	AnomalyThreshold float64     `yaml:"anomaly_threshold"`
-	WebhookURL       string      `yaml:"webhook_url"`
-	Storage          yamlStorage `yaml:"storage"`
+	APIAddr          string          `yaml:"api_addr"`
+	MetricsWindow    string          `yaml:"metrics_window"`
+	BaselineWindows  int             `yaml:"baseline_windows"`
+	AnomalyThreshold float64         `yaml:"anomaly_threshold"`
+	WebhookURL       string          `yaml:"webhook_url"`
+	Storage          yamlStorage     `yaml:"storage"`
+	NormalizePaths     *bool            `yaml:"normalize_paths"` // pointer to distinguish false from unset
+	PathRules          []yamlPathRule   `yaml:"path_rules"`
+	HeaderRules        []yamlHeaderRule `yaml:"header_rules"`
+	HealthCheck        yamlHealthCheck  `yaml:"health_check"`
+	ErrorRateThreshold      float64 `yaml:"error_rate_threshold"`
+	ThroughputDropThreshold float64 `yaml:"throughput_drop_threshold"`
 }
 
 // Load reads the YAML file at path and returns a Config with defaults applied
@@ -138,6 +192,51 @@ func Load(path string) (Config, error) {
 	if yf.WebhookURL != "" {
 		cfg.WebhookURL = yf.WebhookURL
 	}
+	// NormalizePaths uses a pointer so false can be distinguished from "not set".
+	if yf.NormalizePaths != nil {
+		cfg.NormalizePaths = *yf.NormalizePaths
+	}
+	if len(yf.PathRules) > 0 {
+		cfg.PathRules = make([]PathRule, len(yf.PathRules))
+		for i, r := range yf.PathRules {
+			cfg.PathRules[i] = PathRule{Pattern: r.Pattern, Replacement: r.Replacement}
+		}
+	}
+	if len(yf.HeaderRules) > 0 {
+		cfg.HeaderRules = make([]HeaderRule, len(yf.HeaderRules))
+		for i, r := range yf.HeaderRules {
+			cfg.HeaderRules[i] = HeaderRule{Action: r.Action, Header: r.Header, Value: r.Value}
+		}
+	}
+	if yf.HealthCheck.Enabled {
+		cfg.HealthCheck.Enabled = true
+	}
+	if yf.HealthCheck.Path != "" {
+		cfg.HealthCheck.Path = yf.HealthCheck.Path
+	}
+	if yf.HealthCheck.Interval != "" {
+		d, err := parseDuration(yf.HealthCheck.Interval)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: invalid health_check.interval %q: %w", yf.HealthCheck.Interval, err)
+		}
+		cfg.HealthCheck.Interval = d
+	}
+	if yf.HealthCheck.Timeout != "" {
+		d, err := parseDuration(yf.HealthCheck.Timeout)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: invalid health_check.timeout %q: %w", yf.HealthCheck.Timeout, err)
+		}
+		cfg.HealthCheck.Timeout = d
+	}
+	if yf.HealthCheck.Threshold != 0 {
+		cfg.HealthCheck.Threshold = yf.HealthCheck.Threshold
+	}
+	if yf.ErrorRateThreshold != 0 {
+		cfg.ErrorRateThreshold = yf.ErrorRateThreshold
+	}
+	if yf.ThroughputDropThreshold != 0 {
+		cfg.ThroughputDropThreshold = yf.ThroughputDropThreshold
+	}
 
 	return cfg, nil
 }
@@ -187,6 +286,33 @@ func Merge(base, overrides Config) Config {
 	}
 	if overrides.StorageDSN != "" {
 		result.StorageDSN = overrides.StorageDSN
+	}
+	if len(overrides.PathRules) > 0 {
+		result.PathRules = overrides.PathRules
+	}
+	if len(overrides.HeaderRules) > 0 {
+		result.HeaderRules = overrides.HeaderRules
+	}
+	if overrides.HealthCheck.Enabled {
+		result.HealthCheck.Enabled = true
+	}
+	if overrides.HealthCheck.Path != "" {
+		result.HealthCheck.Path = overrides.HealthCheck.Path
+	}
+	if overrides.HealthCheck.Interval != 0 {
+		result.HealthCheck.Interval = overrides.HealthCheck.Interval
+	}
+	if overrides.HealthCheck.Timeout != 0 {
+		result.HealthCheck.Timeout = overrides.HealthCheck.Timeout
+	}
+	if overrides.HealthCheck.Threshold != 0 {
+		result.HealthCheck.Threshold = overrides.HealthCheck.Threshold
+	}
+	if overrides.ErrorRateThreshold != 0 {
+		result.ErrorRateThreshold = overrides.ErrorRateThreshold
+	}
+	if overrides.ThroughputDropThreshold != 0 {
+		result.ThroughputDropThreshold = overrides.ThroughputDropThreshold
 	}
 	return result
 }
@@ -240,6 +366,17 @@ func Validate(cfg Config) error {
 	}
 	if driver == "postgres" && cfg.StorageDSN == "" {
 		return fmt.Errorf("storage dsn required when using postgres driver")
+	}
+	for i, r := range cfg.HeaderRules {
+		if r.Action != "set" && r.Action != "remove" {
+			return fmt.Errorf("header_rules[%d]: action must be \"set\" or \"remove\", got %q", i, r.Action)
+		}
+		if r.Header == "" {
+			return fmt.Errorf("header_rules[%d]: header name is required", i)
+		}
+		if r.Action == "set" && r.Value == "" {
+			return fmt.Errorf("header_rules[%d]: value is required for action \"set\"", i)
+		}
 	}
 	return nil
 }

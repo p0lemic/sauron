@@ -3,18 +3,18 @@
 
 /* ─── Variables ─────────────────────────────────────────────────────── */
 :root {
-  --bg:        #0d0f14;
-  --surface:   #13161f;
-  --surface-2: #1a1e2b;
-  --border:    #1e2535;
-  --border-2:  #252d3d;
-  --text:      #c9d1e0;
-  --text-dim:  #4a5568;
-  --text-muted:#2d3748;
+  --bg:        #161b25;
+  --surface:   #1e2535;
+  --surface-2: #26304a;
+  --border:    #2e3a52;
+  --border-2:  #374560;
+  --text:      #dce6f5;
+  --text-dim:  #6b7fa0;
+  --text-muted:#435070;
   --accent:    #38bdf8;
   --accent-dim:#0e4a6a;
   --danger:    #f87171;
-  --danger-bg: #2d1515;
+  --danger-bg: #3a1a1a;
   --warning:   #fbbf24;
   --ok:        #34d399;
 
@@ -252,6 +252,28 @@ header {
   color: var(--ok);
   border-color: #1a5c3a;
   background: #0d2b1f;
+}
+
+.tr-presets {
+  display: flex;
+  gap: 4px;
+}
+
+.tr-preset {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.tr-preset.active {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: #071f30;
+}
+
+.tr-sep-custom {
+  color: var(--text-muted);
+  font-size: 10px;
+  user-select: none;
 }
 
 /* ─── Main ───────────────────────────────────────────────────────────── */
@@ -681,4 +703,168 @@ section {
   header { padding: 0 16px; }
   main   { padding: calc(var(--header-h) + 20px) 12px 40px; }
   .header-meta { display: none; }
+}
+
+/* ─── Status Breakdown (US-28) ───────────────────────────────────────── */
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+@media (max-width: 640px) {
+  .status-grid { grid-template-columns: repeat(2, 1fr); }
+}
+.status-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.status-card-class {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.status-card-count {
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--text);
+}
+.status-card-rate {
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+.status-bar-wrap {
+  height: 3px;
+  background: var(--border-2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.status-bar {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+.status-2xx.status-card-class,
+.status-2xx.status-card-rate  { color: var(--ok); }
+.status-2xx.status-bar        { background: var(--ok); }
+.status-3xx.status-card-class,
+.status-3xx.status-card-rate  { color: var(--warning); }
+.status-3xx.status-bar        { background: var(--warning); }
+.status-4xx.status-card-class,
+.status-4xx.status-card-rate  { color: #fb923c; }
+.status-4xx.status-bar        { background: #fb923c; }
+.status-5xx.status-card-class,
+.status-5xx.status-card-rate  { color: var(--danger); }
+.status-5xx.status-bar        { background: var(--danger); }
+
+/* ─── Request Log (US-27) ────────────────────────────────────────────── */
+.method-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.badge-get    { background: #0e3a5e; color: #38bdf8; }
+.badge-post   { background: #0e3d1a; color: #34d399; }
+.badge-put    { background: #3d2e00; color: #fbbf24; }
+.badge-patch  { background: #2d1f3d; color: #a78bfa; }
+.badge-delete { background: #3d1010; color: #f87171; }
+.badge-other  { background: var(--surface-2); color: var(--text-dim); }
+
+.status-2xx { color: var(--ok); }
+.status-3xx { color: var(--warning); }
+.status-4xx { color: #fb923c; }
+.status-5xx { color: var(--danger); }
+
+.rl-toolbar { gap: 8px; flex-wrap: wrap; }
+.rl-select {
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.rl-select:focus { outline: none; border-color: var(--accent); }
+.cell-dur { text-align: right; }
+.cell-status { font-weight: 600; }
+
+/* ─── Pagination ─────────────────────────────────────────────────────── */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 10px 16px 4px;
+  border-top: 1px solid var(--border);
+}
+.page-btn {
+  background: var(--surface-2);
+  border: 1px solid var(--border-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color var(--transition), color var(--transition);
+}
+.page-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.page-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+.page-info {
+  font-size: 12px;
+  color: var(--text-dim);
+  min-width: 90px;
+  text-align: center;
+}
+
+/* ─── Alert kind badge (US-40) ───────────────────────────────────────── */
+.kind-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.kind-latency    { background: var(--accent-dim); color: var(--accent); }
+.kind-error-rate { background: #3d1e00;           color: #fb923c; }
+.kind-throughput { background: #0d2b1f;           color: var(--ok); }
+
+/* ─── Upstream health indicator (US-39) ──────────────────────────────── */
+#upstream-health {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.health-healthy  { color: var(--ok); }
+.health-degraded { color: var(--warning); }
+.health-down     { color: var(--danger); }
+.health-unknown  { color: var(--text-muted); }
+
+.health-latency {
+  color: var(--text-dim);
+  margin-left: 3px;
 }

@@ -32,7 +32,8 @@ func (s *syncStore) Save(r storage.Record) error {
 	return nil
 }
 
-func (s *syncStore) Close() error { return nil }
+func (s *syncStore) Prune(_ time.Time) (int64, error) { return 0, nil }
+func (s *syncStore) Close() error                     { return nil }
 
 func (s *syncStore) len() int {
 	s.mu.Lock()
@@ -49,7 +50,8 @@ func (s *notifyStore) Save(r storage.Record) error {
 	s.saved <- r
 	return nil
 }
-func (s *notifyStore) Close() error { return nil }
+func (s *notifyStore) Prune(_ time.Time) (int64, error) { return 0, nil }
+func (s *notifyStore) Close() error                     { return nil }
 
 // TC-12: Close drains all enqueued records before returning.
 func TestRecorderCloseDrainsChannel(t *testing.T) {

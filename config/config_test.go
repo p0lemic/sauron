@@ -633,3 +633,96 @@ func TestCLIOverridesEnv(t *testing.T) {
 
 	assert.Equal(t, "http://from-cli", result.Upstream)
 }
+
+// --- US-26: Path normalization config ---
+
+// TC-15: Default() sets NormalizePaths=true and PathRules=nil.
+func TestDefaultNormalizePaths(t *testing.T) {
+	cfg := config.Default()
+	assert.True(t, cfg.NormalizePaths)
+	assert.Nil(t, cfg.PathRules)
+}
+
+// TC-16: YAML normalize_paths: false → NormalizePaths=false.
+func TestLoadNormalizePathsFalse(t *testing.T) {
+	path := writeYAML(t, "upstream: http://x\nnormalize_paths: false")
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.NormalizePaths)
+}
+
+// TC-17: YAML path_rules parsed into []PathRule correctly.
+func TestLoadPathRules(t *testing.T) {
+	path := writeYAML(t, `
+upstream: http://x
+path_rules:
+  - pattern: "^v[0-9]+$"
+    replacement: ":version"
+  - pattern: "^[a-z]{2}-[A-Z]{2}$"
+    replacement: ":locale"
+`)
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	require.Len(t, cfg.PathRules, 2)
+	assert.Equal(t, "^v[0-9]+$", cfg.PathRules[0].Pattern)
+	assert.Equal(t, ":version", cfg.PathRules[0].Replacement)
+	assert.Equal(t, "^[a-z]{2}-[A-Z]{2}$", cfg.PathRules[1].Pattern)
+	assert.Equal(t, ":locale", cfg.PathRules[1].Replacement)
+}
+
+// TC-01 (US-37): YAML con header_rules → carga correctamente.
+func TestLoadHeaderRules(t *testing.T) {
+	path := writeYAML(t, `
+upstream: http://localhost:3000
+header_rules:
+  - action: set
+    header: X-Forwarded-By
+    value: api-profiler
+  - action: remove
+    header: X-Internal-Secret
+`)
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	require.Len(t, cfg.HeaderRules, 2)
+	assert.Equal(t, "set", cfg.HeaderRules[0].Action)
+	assert.Equal(t, "X-Forwarded-By", cfg.HeaderRules[0].Header)
+	assert.Equal(t, "api-profiler", cfg.HeaderRules[0].Value)
+	assert.Equal(t, "remove", cfg.HeaderRules[1].Action)
+	assert.Equal(t, "X-Internal-Secret", cfg.HeaderRules[1].Header)
+}
+
+// TC-02 (US-37): action inválido → Validate retorna error.
+func TestValidateHeaderRuleInvalidAction(t *testing.T) {
+	cfg := config.Default()
+	cfg.Upstream = "http://localhost:3000"
+	cfg.HeaderRules = []config.HeaderRule{
+		{Action: "append", Header: "X-Foo", Value: "bar"},
+	}
+	err := config.Validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "action")
+}
+
+// TC-03 (US-37): header vacío → Validate retorna error.
+func TestValidateHeaderRuleEmptyHeader(t *testing.T) {
+	cfg := config.Default()
+	cfg.Upstream = "http://localhost:3000"
+	cfg.HeaderRules = []config.HeaderRule{
+		{Action: "set", Header: "", Value: "bar"},
+	}
+	err := config.Validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "header name")
+}
+
+// TC-04 (US-37): action=set con value vacío → Validate retorna error.
+func TestValidateHeaderRuleSetEmptyValue(t *testing.T) {
+	cfg := config.Default()
+	cfg.Upstream = "http://localhost:3000"
+	cfg.HeaderRules = []config.HeaderRule{
+		{Action: "set", Header: "X-Foo", Value: ""},
+	}
+	err := config.Validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "value")
+}

@@ -10,16 +10,19 @@ import (
 
 // Record represents the metadata of a single proxied request.
 type Record struct {
-	Timestamp  time.Time
-	Method     string
-	Path       string
-	StatusCode int
-	DurationMs float64
+	Timestamp  time.Time `json:"timestamp"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	StatusCode int       `json:"status_code"`
+	DurationMs float64   `json:"duration_ms"`
 }
 
 // Store persists request records.
 type Store interface {
 	Save(r Record) error
+	// Prune deletes all records with timestamp strictly before before.
+	// Returns the number of rows deleted.
+	Prune(before time.Time) (int64, error)
 	Close() error
 }
 
@@ -79,6 +82,21 @@ func (s *sqliteStore) Save(r Record) error {
 		return fmt.Errorf("storage: insert: %w", err)
 	}
 	return nil
+}
+
+func (s *sqliteStore) Prune(before time.Time) (int64, error) {
+	res, err := s.db.Exec(
+		`DELETE FROM requests WHERE timestamp < ?`,
+		before.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("storage: prune: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("storage: prune rows affected: %w", err)
+	}
+	return n, nil
 }
 
 func (s *sqliteStore) Close() error {

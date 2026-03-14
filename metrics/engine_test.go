@@ -28,6 +28,16 @@ func (m *mockReader) FindByWindow(from, to time.Time) ([]storage.Record, error) 
 	return m.records, nil
 }
 
+func (m *mockReader) FindRecent(_ time.Time, _ time.Time, limit int) ([]storage.Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := m.records
+	if limit < len(out) {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (m *mockReader) captured() (time.Time, time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -250,6 +260,28 @@ func TestBaselineSampleCount(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, stats, 1)
 	assert.Equal(t, 20, stats[0].SampleCount)
+}
+
+// TC-06 (US-41): Baseline() returns BaselineRPS > 0 when records exist.
+func TestBaselineRPS(t *testing.T) {
+	// 60 records, window=1min, n=1 → BaselineRPS = 60 / (1*60) = 1.0
+	records := make([]storage.Record, 60)
+	for i := range records {
+		records[i] = rec("GET", "/x", 10)
+	}
+	e := newEngine(records, time.Minute)
+	stats, err := e.Baseline(1)
+	require.NoError(t, err)
+	require.Len(t, stats, 1)
+	assert.InDelta(t, 1.0, stats[0].BaselineRPS, 0.01)
+}
+
+// TC-07 (US-41): Baseline() with no records → BaselineRPS = 0.
+func TestBaselineRPSEmpty(t *testing.T) {
+	e := newEngine(nil, time.Minute)
+	stats, err := e.Baseline(5)
+	require.NoError(t, err)
+	assert.Empty(t, stats)
 }
 
 // --- US-11: Throughput ---
@@ -834,4 +866,200 @@ func TestHistogramAlways9Buckets(t *testing.T) {
 	h, err := e.Histogram("", "")
 	require.NoError(t, err)
 	assert.Len(t, h.Buckets, 9)
+}
+
+// TC-05 (US-27): Requests(n) returns up to n records.
+func TestRequestsReturnsN(t *testing.T) {
+	records := []storage.Record{
+		rec("GET", "/a", 10),
+		rec("GET", "/b", 20),
+		rec("GET", "/c", 30),
+	}
+	e := newEngine(records, time.Minute)
+	got, err := e.Requests(2)
+	require.NoError(t, err)
+	assert.Len(t, got, 2)
+}
+
+// TC-06 (US-27): Requests: n clamped to max 1000.
+func TestRequestsNClampedToMax(t *testing.T) {
+	records := make([]storage.Record, 5)
+	for i := range records {
+		records[i] = rec("GET", "/x", 1)
+	}
+	e := newEngine(records, time.Minute)
+	got, err := e.Requests(9999)
+	require.NoError(t, err)
+	assert.Len(t, got, 5)
+}
+
+// TC-07 (US-27): RequestsForRange delegates correctly.
+func TestRequestsForRange(t *testing.T) {
+	now := time.Now()
+	records := []storage.Record{
+		{Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 1, Timestamp: now.Add(-30 * time.Second)},
+	}
+	e := newEngine(records, time.Minute)
+	got, err := e.RequestsForRange(now.Add(-time.Minute), now, 10)
+	require.NoError(t, err)
+	assert.Len(t, got, 1)
+}
+
+// TC-01 (US-28): Sin registros → 4 grupos, todos count=0 rate=0.0.
+func TestStatusBreakdownEmpty(t *testing.T) {
+	e := newEngine(nil, time.Minute)
+	groups, err := e.StatusBreakdown()
+	require.NoError(t, err)
+	require.Len(t, groups, 4)
+	for _, g := range groups {
+		assert.Equal(t, 0, g.Count)
+		assert.Equal(t, 0.0, g.Rate)
+	}
+	assert.Equal(t, "2xx", groups[0].Class)
+	assert.Equal(t, "3xx", groups[1].Class)
+	assert.Equal(t, "4xx", groups[2].Class)
+	assert.Equal(t, "5xx", groups[3].Class)
+}
+
+// TC-02 (US-28): Registros mixtos → counts y rates correctos.
+func TestStatusBreakdownMixed(t *testing.T) {
+	now := time.Now()
+	records := []storage.Record{
+		{Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/a", StatusCode: 301, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/a", StatusCode: 404, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/a", StatusCode: 500, DurationMs: 1, Timestamp: now},
+	}
+	e := newEngine(records, time.Minute)
+	groups, err := e.StatusBreakdown()
+	require.NoError(t, err)
+	require.Len(t, groups, 4)
+	assert.Equal(t, 2, groups[0].Count) // 2xx
+	assert.Equal(t, 1, groups[1].Count) // 3xx
+	assert.Equal(t, 1, groups[2].Count) // 4xx
+	assert.Equal(t, 1, groups[3].Count) // 5xx
+	assert.InDelta(t, 40.0, groups[0].Rate, 0.05)
+}
+
+// TC-03 (US-28): Solo 2xx → rate=100%, resto 0%.
+func TestStatusBreakdownOnly2xx(t *testing.T) {
+	records := []storage.Record{
+		{StatusCode: 200, DurationMs: 1, Timestamp: time.Now()},
+		{StatusCode: 201, DurationMs: 1, Timestamp: time.Now()},
+	}
+	e := newEngine(records, time.Minute)
+	groups, err := e.StatusBreakdown()
+	require.NoError(t, err)
+	assert.Equal(t, 100.0, groups[0].Rate)
+	assert.Equal(t, 0.0, groups[1].Rate)
+	assert.Equal(t, 0.0, groups[2].Rate)
+	assert.Equal(t, 0.0, groups[3].Rate)
+}
+
+// TC-01 (US-32): StatusBreakdownForEndpoint filtra correctamente por method+path.
+func TestStatusBreakdownForEndpoint(t *testing.T) {
+	now := time.Now()
+	records := []storage.Record{
+		{Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/a", StatusCode: 500, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/b", StatusCode: 404, DurationMs: 1, Timestamp: now}, // different endpoint
+	}
+	e := newEngine(records, time.Minute)
+	groups, err := e.StatusBreakdownForEndpoint("GET", "/a")
+	require.NoError(t, err)
+	require.Len(t, groups, 4)
+	assert.Equal(t, 1, groups[0].Count) // 2xx
+	assert.Equal(t, 0, groups[2].Count) // 4xx — /b not counted
+	assert.Equal(t, 1, groups[3].Count) // 5xx
+	assert.InDelta(t, 50.0, groups[0].Rate, 0.05)
+}
+
+// TC-02 (US-32): StatusBreakdownForEndpoint con endpoint sin registros → 4 grupos count=0.
+func TestStatusBreakdownForEndpointNoRecords(t *testing.T) {
+	e := newEngine(nil, time.Minute)
+	groups, err := e.StatusBreakdownForEndpoint("GET", "/missing")
+	require.NoError(t, err)
+	require.Len(t, groups, 4)
+	for _, g := range groups {
+		assert.Equal(t, 0, g.Count)
+		assert.Equal(t, 0.0, g.Rate)
+	}
+}
+
+// TC-01 (US-29): SlowestRequests devuelve registros ordenados por duration_ms DESC.
+func TestSlowestRequestsOrder(t *testing.T) {
+	records := []storage.Record{
+		{Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 10, Timestamp: time.Now()},
+		{Method: "GET", Path: "/b", StatusCode: 200, DurationMs: 500, Timestamp: time.Now()},
+		{Method: "GET", Path: "/c", StatusCode: 200, DurationMs: 50, Timestamp: time.Now()},
+	}
+	e := newEngine(records, time.Minute)
+	got, err := e.SlowestRequests(10)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	assert.Equal(t, 500.0, got[0].DurationMs)
+	assert.Equal(t, 50.0, got[1].DurationMs)
+	assert.Equal(t, 10.0, got[2].DurationMs)
+}
+
+// TC-02 (US-29): SlowestRequests respeta el límite n.
+func TestSlowestRequestsLimit(t *testing.T) {
+	records := []storage.Record{
+		{DurationMs: 100, Timestamp: time.Now()},
+		{DurationMs: 200, Timestamp: time.Now()},
+		{DurationMs: 300, Timestamp: time.Now()},
+	}
+	e := newEngine(records, time.Minute)
+	got, err := e.SlowestRequests(2)
+	require.NoError(t, err)
+	assert.Len(t, got, 2)
+	assert.Equal(t, 300.0, got[0].DurationMs)
+}
+
+// TC-03 (US-29): SlowestRequests con n > total devuelve todos.
+func TestSlowestRequestsNGreaterThanTotal(t *testing.T) {
+	records := []storage.Record{
+		{DurationMs: 10, Timestamp: time.Now()},
+		{DurationMs: 20, Timestamp: time.Now()},
+	}
+	e := newEngine(records, time.Minute)
+	got, err := e.SlowestRequests(50)
+	require.NoError(t, err)
+	assert.Len(t, got, 2)
+}
+
+// TC-04 (US-29): SlowestRequests sin registros → slice vacío (no nil).
+func TestSlowestRequestsEmpty(t *testing.T) {
+	e := newEngine(nil, time.Minute)
+	got, err := e.SlowestRequests(10)
+	require.NoError(t, err)
+	assert.NotNil(t, got)
+	assert.Len(t, got, 0)
+}
+
+// TC-05 (US-29): n coartado a máximo 100.
+func TestSlowestRequestsNClamp(t *testing.T) {
+	records := make([]storage.Record, 5)
+	for i := range records {
+		records[i] = storage.Record{DurationMs: float64(i + 1), Timestamp: time.Now()}
+	}
+	e := newEngine(records, time.Minute)
+	got, err := e.SlowestRequests(9999)
+	require.NoError(t, err)
+	assert.Len(t, got, 5) // clamped to 100, only 5 exist
+}
+
+// TC-04 (US-28): StatusBreakdownForRange respeta el rango.
+func TestStatusBreakdownForRange(t *testing.T) {
+	now := time.Now()
+	records := []storage.Record{
+		{StatusCode: 200, DurationMs: 1, Timestamp: now.Add(-30 * time.Second)},
+		{StatusCode: 500, DurationMs: 1, Timestamp: now.Add(-30 * time.Second)},
+	}
+	e := newEngine(records, time.Minute)
+	groups, err := e.StatusBreakdownForRange(now.Add(-time.Minute), now)
+	require.NoError(t, err)
+	assert.Equal(t, 1, groups[0].Count) // 2xx
+	assert.Equal(t, 1, groups[3].Count) // 5xx
 }

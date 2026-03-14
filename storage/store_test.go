@@ -115,6 +115,70 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 	assert.Equal(t, "/item/1", recs[0].Path)
 }
 
+// ── US-43: Prune ─────────────────────────────────────────────────────────────
+
+// TC-01: Prune removes old rows and returns correct count.
+func TestPruneRemovesOldRecords(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	now := time.Now().UTC()
+	threshold := now.Add(-30 * time.Minute)
+
+	require.NoError(t, s.Save(Record{Timestamp: now.Add(-2 * time.Hour), Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 1}))
+	require.NoError(t, s.Save(Record{Timestamp: now.Add(-1 * time.Hour), Method: "GET", Path: "/b", StatusCode: 200, DurationMs: 1}))
+	require.NoError(t, s.Save(Record{Timestamp: now.Add(-5 * time.Minute), Method: "GET", Path: "/c", StatusCode: 200, DurationMs: 1}))
+
+	n, err := s.Prune(threshold)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, n)
+
+	remaining := allRecords(t, s)
+	require.Len(t, remaining, 1)
+	assert.Equal(t, "/c", remaining[0].Path)
+}
+
+// TC-02: Prune returns 0 when no rows match.
+func TestPruneNoEligibleRows(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, s.Save(Record{Timestamp: time.Now(), Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 1}))
+
+	n, err := s.Prune(time.Now().Add(-1 * time.Hour))
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, n)
+	assert.Len(t, allRecords(t, s), 1)
+}
+
+// TC-03: Prune on empty DB returns 0 without error.
+func TestPruneEmptyDB(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	n, err := s.Prune(time.Now())
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, n)
+}
+
+// TC-04: Row exactly at the threshold is NOT deleted (strict < before).
+func TestPruneExactThreshold(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	threshold := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, s.Save(Record{Timestamp: threshold, Method: "GET", Path: "/edge", StatusCode: 200, DurationMs: 1}))
+
+	n, err := s.Prune(threshold)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, n)
+	assert.Len(t, allRecords(t, s), 1)
+}
+
 // Verify that the db file is created on disk (not just in memory).
 func TestNewCreatesFileOnDisk(t *testing.T) {
 	dir := t.TempDir()

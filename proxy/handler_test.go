@@ -30,7 +30,8 @@ func (s *capturingStore) Save(r storage.Record) error {
 	s.mu.Unlock()
 	return nil
 }
-func (s *capturingStore) Close() error { return nil }
+func (s *capturingStore) Prune(_ time.Time) (int64, error) { return 0, nil }
+func (s *capturingStore) Close() error                     { return nil }
 
 func (s *capturingStore) all() []storage.Record {
 	s.mu.Lock()
@@ -696,6 +697,39 @@ func TestResponseHeaderContentTypeWithCharset(t *testing.T) {
 	assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
 }
 
+// US-26 TC-18: Normalizer configured → Record.Path contains normalised path.
+func TestNormalizerApplied(t *testing.T) {
+	upstream, u := newUpstream(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	defer upstream.Close()
+
+	store := &capturingStore{}
+	rec := storage.NewRecorder(store, 100)
+	t.Cleanup(func() { rec.Close() })
+
+	h, err := proxy.New(proxy.Config{
+		Upstream:   u,
+		Recorder:   rec,
+		Normalizer: func(p string) string { return "/normalised" },
+	})
+	require.NoError(t, err)
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/users/123", nil))
+	require.True(t, waitForRecords(store, 1, 200*time.Millisecond))
+	assert.Equal(t, "/normalised", store.all()[0].Path)
+}
+
+// US-26 TC-19: Normalizer nil → Record.Path contains original path.
+func TestNormalizerNilKeepsOriginalPath(t *testing.T) {
+	upstream, u := newUpstream(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	defer upstream.Close()
+
+	h, store := newHandlerWithRecorder(t, u)
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/users/123", nil))
+	require.True(t, waitForRecords(store, 1, 200*time.Millisecond))
+	assert.Equal(t, "/users/123", store.all()[0].Path)
+}
+
 // US-02 TC-07: 100 concurrent requests → 100 records.
 func TestRecorderConcurrentRequests(t *testing.T) {
 	upstream, u := newUpstream(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
@@ -713,4 +747,89 @@ func TestRecorderConcurrentRequests(t *testing.T) {
 	wg.Wait()
 	require.True(t, waitForRecords(store, 100, 200*time.Millisecond), "all 100 records must be saved")
 	assert.Len(t, store.all(), 100)
+}
+
+// ── Header rewrite (US-37) ────────────────────────────────────────────────────
+
+// captureUpstream creates a test upstream that stores the last received headers.
+func captureUpstream() (*httptest.Server, func() http.Header) {
+	var mu sync.Mutex
+	var captured http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		captured = r.Header.Clone()
+		mu.Unlock()
+	}))
+	return srv, func() http.Header {
+		mu.Lock()
+		defer mu.Unlock()
+		return captured
+	}
+}
+
+// TC-05 (US-37): RewriteHeaders=nil → headers sin modificar.
+func TestRewriteHeadersNil(t *testing.T) {
+	srv, getHeaders := captureUpstream()
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	h := newHandler(t, u)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Custom", "original")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	assert.Equal(t, "original", getHeaders().Get("X-Custom"))
+}
+
+// TC-06 (US-37): action=set → header presente en upstream.
+func TestRewriteHeadersSet(t *testing.T) {
+	srv, getHeaders := captureUpstream()
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	h := newHandler(t, u, func(cfg *proxy.Config) {
+		cfg.RewriteHeaders = func(hdr http.Header) { hdr.Set("X-Injected", "hello") }
+	})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Equal(t, "hello", getHeaders().Get("X-Injected"))
+}
+
+// TC-07 (US-37): action=set sobreescribe header existente.
+func TestRewriteHeadersSetOverwrite(t *testing.T) {
+	srv, getHeaders := captureUpstream()
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	h := newHandler(t, u, func(cfg *proxy.Config) {
+		cfg.RewriteHeaders = func(hdr http.Header) { hdr.Set("X-Token", "new-value") }
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Token", "old-value")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	assert.Equal(t, "new-value", getHeaders().Get("X-Token"))
+}
+
+// TC-08 (US-37): action=remove → header eliminado en upstream.
+func TestRewriteHeadersRemove(t *testing.T) {
+	srv, getHeaders := captureUpstream()
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	h := newHandler(t, u, func(cfg *proxy.Config) {
+		cfg.RewriteHeaders = func(hdr http.Header) { hdr.Del("X-Secret") }
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Secret", "sensitive")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	assert.Empty(t, getHeaders().Get("X-Secret"))
+}
+
+// TC-09 (US-37): reglas aplicadas en orden (set luego remove sobre mismo header).
+func TestRewriteHeadersOrder(t *testing.T) {
+	srv, getHeaders := captureUpstream()
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	h := newHandler(t, u, func(cfg *proxy.Config) {
+		cfg.RewriteHeaders = func(hdr http.Header) {
+			hdr.Set("X-Temp", "value")
+			hdr.Del("X-Temp")
+		}
+	})
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Empty(t, getHeaders().Get("X-Temp"))
 }

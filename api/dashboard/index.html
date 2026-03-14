@@ -22,6 +22,14 @@
   <div class="timerange-bar" id="timerange-bar">
     <div class="timerange-inner">
       <span class="timerange-label">Range</span>
+      <div class="tr-presets">
+        <button class="tr-btn tr-preset" data-preset="15m">15m</button>
+        <button class="tr-btn tr-preset" data-preset="1h">1h</button>
+        <button class="tr-btn tr-preset" data-preset="6h">6h</button>
+        <button class="tr-btn tr-preset" data-preset="24h">24h</button>
+        <button class="tr-btn tr-preset" data-preset="7d">7d</button>
+      </div>
+      <span class="timerange-sep tr-sep-custom">|</span>
       <div class="timerange-inputs">
         <input type="datetime-local" id="tr-from" class="tr-input" title="From">
         <span class="timerange-sep">→</span>
@@ -43,6 +51,15 @@
       </div>
     </section>
 
+    <section id="status-breakdown">
+      <div class="section-header">
+        <span class="section-title"><span class="dot"></span>Status</span>
+      </div>
+      <div class="section-body">
+        <div class="placeholder">loading status…</div>
+      </div>
+    </section>
+
     <section id="alerts" style="display:none">
       <div class="section-header">
         <span class="section-title"><span class="dot dot-danger"></span>Active Alerts</span>
@@ -59,6 +76,24 @@
       </div>
     </section>
 
+    <section id="slowest-requests">
+      <div class="section-header">
+        <span class="section-title"><span class="dot"></span>Slowest Requests</span>
+      </div>
+      <div class="section-body">
+        <div class="placeholder">loading slowest requests…</div>
+      </div>
+    </section>
+
+    <section id="request-log">
+      <div class="section-header">
+        <span class="section-title"><span class="dot"></span>Request Log</span>
+      </div>
+      <div class="section-body">
+        <div class="placeholder">loading request log…</div>
+      </div>
+    </section>
+
   </main>
 
   <div class="statusbar">
@@ -66,6 +101,7 @@
       <span class="indicator"></span>
       <span>connected</span>
     </div>
+    <span id="upstream-health" style="display:none"></span>
     <span>poll · 5s</span>
     <span id="last-updated"></span>
   </div>

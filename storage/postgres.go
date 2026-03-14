@@ -94,6 +94,47 @@ func (s *postgresStore) FindByWindow(from, to time.Time) ([]Record, error) {
 	return out, rows.Err()
 }
 
+func (s *postgresStore) FindRecent(from, to time.Time, limit int) ([]Record, error) {
+	rows, err := s.db.Query(
+		`SELECT timestamp, method, path, status_code, duration_ms
+		 FROM requests
+		 WHERE timestamp >= $1 AND timestamp < $2
+		 ORDER BY timestamp DESC
+		 LIMIT $3`,
+		from.UTC(),
+		to.UTC(),
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("storage: FindRecent: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Record{}
+	for rows.Next() {
+		var rec Record
+		var ts time.Time
+		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs); err != nil {
+			return nil, fmt.Errorf("storage: FindRecent scan: %w", err)
+		}
+		rec.Timestamp = ts.UTC()
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) Prune(before time.Time) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM requests WHERE timestamp < $1`, before.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("storage: prune: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("storage: prune rows affected: %w", err)
+	}
+	return n, nil
+}
+
 func (s *postgresStore) Close() error {
 	return s.db.Close()
 }

@@ -75,11 +75,12 @@ func endpointsFromRecords(records []storage.Record) []EndpointStat {
 	return stats
 }
 
-// BaselineStat holds baseline latency statistics for one method+path.
+// BaselineStat holds baseline latency and throughput statistics for one method+path.
 type BaselineStat struct {
 	Method      string  `json:"method"`
 	Path        string  `json:"path"`
 	BaselineP99 float64 `json:"baseline_p99"`
+	BaselineRPS float64 `json:"baseline_rps"` // average req/s over the baseline window
 	SampleCount int     `json:"sample_count"`
 }
 
@@ -101,6 +102,7 @@ func (e *Engine) Baseline(n int) ([]BaselineStat, error) {
 		groups[k] = append(groups[k], r.DurationMs)
 	}
 
+	baselineWindowSecs := float64(n) * e.window.Seconds()
 	stats := make([]BaselineStat, 0, len(groups))
 	for k, durations := range groups {
 		sort.Float64s(durations)
@@ -108,6 +110,7 @@ func (e *Engine) Baseline(n int) ([]BaselineStat, error) {
 			Method:      k.method,
 			Path:        k.path,
 			BaselineP99: pct(durations, 99),
+			BaselineRPS: float64(len(durations)) / baselineWindowSecs,
 			SampleCount: len(durations),
 		})
 	}
@@ -320,10 +323,11 @@ type BucketStat struct {
 func (e *Engine) Latency(method, path string) ([]BucketStat, error) {
 	const buckets = 60
 	minute := time.Minute
-	now := time.Now().Truncate(minute)
+	actualNow := time.Now().UTC()
+	now := actualNow.Truncate(minute)
 	from := now.Add(-buckets * minute)
 
-	records, err := e.reader.FindByWindow(from, now)
+	records, err := e.reader.FindByWindow(from, actualNow)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +337,7 @@ func (e *Engine) Latency(method, path string) ([]BucketStat, error) {
 		if r.Method != method || r.Path != path {
 			continue
 		}
-		bucket := r.Timestamp.Truncate(minute)
+		bucket := r.Timestamp.UTC().Truncate(minute)
 		groups[bucket] = append(groups[bucket], r.DurationMs)
 	}
 
@@ -463,6 +467,159 @@ func (e *Engine) tableForRange(from, to time.Time, liveRPS bool) ([]TableRow, er
 		})
 	}
 	return rows, nil
+}
+
+// StatusGroup holds aggregated counts for one HTTP status class.
+type StatusGroup struct {
+	Class string  `json:"class"` // "2xx", "3xx", "4xx", "5xx"
+	Count int     `json:"count"`
+	Rate  float64 `json:"rate"` // percentage of total (0–100, 1 decimal)
+}
+
+var statusClasses = []string{"2xx", "3xx", "4xx", "5xx"}
+
+// StatusBreakdown returns counts and rates per status class for the engine's window.
+// Always returns 4 groups in order: 2xx, 3xx, 4xx, 5xx.
+func (e *Engine) StatusBreakdown() ([]StatusGroup, error) {
+	now := time.Now()
+	return e.StatusBreakdownForRange(now.Add(-e.window), now)
+}
+
+// StatusBreakdownForRange returns counts and rates per status class for [from, to).
+func (e *Engine) StatusBreakdownForRange(from, to time.Time) ([]StatusGroup, error) {
+	records, err := e.reader.FindByWindow(from, to)
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[string]int, 4)
+	for _, c := range statusClasses {
+		counts[c] = 0
+	}
+	for _, r := range records {
+		switch {
+		case r.StatusCode >= 500:
+			counts["5xx"]++
+		case r.StatusCode >= 400:
+			counts["4xx"]++
+		case r.StatusCode >= 300:
+			counts["3xx"]++
+		default:
+			counts["2xx"]++
+		}
+	}
+	total := len(records)
+	groups := make([]StatusGroup, len(statusClasses))
+	for i, c := range statusClasses {
+		cnt := counts[c]
+		var rate float64
+		if total > 0 {
+			rate = math.Round(float64(cnt)/float64(total)*100*10) / 10
+		}
+		groups[i] = StatusGroup{Class: c, Count: cnt, Rate: rate}
+	}
+	return groups, nil
+}
+
+// StatusBreakdownForEndpoint returns status breakdown for a single endpoint
+// within the engine's default window.
+func (e *Engine) StatusBreakdownForEndpoint(method, path string) ([]StatusGroup, error) {
+	now := time.Now()
+	return e.StatusBreakdownForEndpointRange(method, path, now.Add(-e.window), now)
+}
+
+// StatusBreakdownForEndpointRange returns status breakdown for a single endpoint
+// within [from, to).
+func (e *Engine) StatusBreakdownForEndpointRange(method, path string, from, to time.Time) ([]StatusGroup, error) {
+	records, err := e.reader.FindByWindow(from, to)
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[string]int, 4)
+	for _, c := range statusClasses {
+		counts[c] = 0
+	}
+	total := 0
+	for _, r := range records {
+		if r.Method != method || r.Path != path {
+			continue
+		}
+		total++
+		switch {
+		case r.StatusCode >= 500:
+			counts["5xx"]++
+		case r.StatusCode >= 400:
+			counts["4xx"]++
+		case r.StatusCode >= 300:
+			counts["3xx"]++
+		default:
+			counts["2xx"]++
+		}
+	}
+	groups := make([]StatusGroup, len(statusClasses))
+	for i, c := range statusClasses {
+		cnt := counts[c]
+		var rate float64
+		if total > 0 {
+			rate = math.Round(float64(cnt)/float64(total)*100*10) / 10
+		}
+		groups[i] = StatusGroup{Class: c, Count: cnt, Rate: rate}
+	}
+	return groups, nil
+}
+
+const maxSlowestRequests = 100
+
+// SlowestRequests returns the n slowest individual requests in the engine's window,
+// sorted by duration_ms descending. n is clamped to [1, 100].
+func (e *Engine) SlowestRequests(n int) ([]storage.Record, error) {
+	now := time.Now()
+	return e.SlowestRequestsForRange(now.Add(-e.window), now, n)
+}
+
+// SlowestRequestsForRange returns the n slowest individual requests in [from, to),
+// sorted by duration_ms descending. n is clamped to [1, 100].
+func (e *Engine) SlowestRequestsForRange(from, to time.Time, n int) ([]storage.Record, error) {
+	if n < 1 {
+		n = 1
+	}
+	if n > maxSlowestRequests {
+		n = maxSlowestRequests
+	}
+	records, err := e.reader.FindByWindow(from, to)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].DurationMs > records[j].DurationMs
+	})
+	if n < len(records) {
+		records = records[:n]
+	}
+	if records == nil {
+		records = []storage.Record{}
+	}
+	return records, nil
+}
+
+const maxRequests = 1000
+
+// Requests returns the most recent n requests within the engine's default window.
+// n is clamped to [1, 1000].
+func (e *Engine) Requests(n int) ([]storage.Record, error) {
+	now := time.Now()
+	return e.RequestsForRange(now.Add(-e.window), now, n)
+}
+
+// RequestsForRange returns the most recent n requests in [from, to).
+// n is clamped to [1, 1000].
+func (e *Engine) RequestsForRange(from, to time.Time, n int) ([]storage.Record, error) {
+	if n < 1 {
+		n = 1
+	}
+	if n > maxRequests {
+		n = maxRequests
+	}
+	return e.reader.FindRecent(from, to, n)
 }
 
 // Slowest returns the top n endpoints by P99 descending within the engine's window.

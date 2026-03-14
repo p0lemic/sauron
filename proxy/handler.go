@@ -18,11 +18,13 @@ import (
 
 // Config contains the proxy configuration.
 type Config struct {
-	Upstream      *url.URL
-	Port          int
-	Timeout       time.Duration
-	Recorder      *storage.Recorder // nil disables metrics capture
-	TLSSkipVerify bool
+	Upstream       *url.URL
+	Port           int
+	Timeout        time.Duration
+	Recorder       *storage.Recorder   // nil disables metrics capture
+	TLSSkipVerify  bool
+	Normalizer     func(string) string // nil disables path normalization
+	RewriteHeaders func(http.Header)   // nil disables header rewriting
 }
 
 // Handler implements http.Handler. It forwards requests to the upstream
@@ -71,6 +73,9 @@ func New(cfg Config) (*Handler, error) {
 			}
 			// Set Host so the upstream receives its own hostname, not the proxy's.
 			req.Host = upstream.Host
+			if cfg.RewriteHeaders != nil {
+				cfg.RewriteHeaders(req.Header)
+			}
 		},
 		Transport: &timeoutTransport{
 			transport: baseTransport,
@@ -99,10 +104,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	durationMs := float64(time.Since(start).Microseconds()) / 1000
 	log.Printf("%s %s %d %.3fms", r.Method, r.URL.RequestURI(), sw.code, durationMs)
 	if h.cfg.Recorder != nil {
+		path := r.URL.Path
+		if h.cfg.Normalizer != nil {
+			path = h.cfg.Normalizer(path)
+		}
 		h.cfg.Recorder.Record(storage.Record{
 			Timestamp:  start,
 			Method:     r.Method,
-			Path:       r.URL.Path,
+			Path:       path,
 			StatusCode: sw.code,
 			DurationMs: durationMs,
 		})

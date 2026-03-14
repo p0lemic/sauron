@@ -27,6 +27,14 @@ func (r *splitReader) FindByWindow(from, to time.Time) ([]storage.Record, error)
 	return r.baselineRecords, nil
 }
 
+func (r *splitReader) FindRecent(_ time.Time, _ time.Time, limit int) ([]storage.Record, error) {
+	out := r.currentRecords
+	if limit < len(out) {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func makeRecs(method, path string, durations []float64) []storage.Record {
 	out := make([]storage.Record, len(durations))
 	for i, d := range durations {
@@ -330,4 +338,204 @@ func TestDetectorOnlyAnomalousEndpoints(t *testing.T) {
 	active := d.Active()
 	require.Len(t, active, 1)
 	assert.Equal(t, "/slow", active[0].Path)
+}
+
+// --- US-40: Error rate alerts ---
+
+// helper: reader with error records for error rate tests.
+func makeErrRecs(method, path string, total, errors int) []storage.Record {
+	out := make([]storage.Record, total)
+	for i := range out {
+		sc := 200
+		if i < errors {
+			sc = 500
+		}
+		out[i] = storage.Record{Method: method, Path: path, StatusCode: sc, DurationMs: 10, Timestamp: time.Now()}
+	}
+	return out
+}
+
+// TC-01 (US-40): ErrorRateThreshold=0 → disabled, no alert even at 100% errors.
+func TestErrorRateThresholdZeroDisabled(t *testing.T) {
+	window := time.Minute
+	reader := &splitReader{
+		window:         window,
+		currentRecords: makeErrRecs("GET", "/x", 10, 10), // 100% errors
+	}
+	engine := metrics.NewEngine(reader, window)
+	d := alerts.NewDetector(engine, 999.0, 5) // latency threshold very high to ignore
+	// SetErrorRateThreshold NOT called → defaults to 0
+	d.Evaluate()
+	assert.Empty(t, d.Active())
+}
+
+// TC-02 (US-40): error_rate > threshold → alert with kind="error_rate".
+func TestErrorRateAlertFires(t *testing.T) {
+	window := time.Minute
+	reader := &splitReader{
+		window:         window,
+		currentRecords: makeErrRecs("GET", "/x", 10, 5), // 50% errors
+	}
+	engine := metrics.NewEngine(reader, window)
+	d := alerts.NewDetector(engine, 999.0, 5)
+	d.SetErrorRateThreshold(10.0) // threshold 10%
+	d.Evaluate()
+
+	active := d.Active()
+	require.Len(t, active, 1)
+	assert.Equal(t, alerts.KindErrorRate, active[0].Kind)
+	assert.Equal(t, "GET", active[0].Method)
+	assert.Equal(t, "/x", active[0].Path)
+	assert.Greater(t, active[0].ErrorRate, active[0].ErrorRateThreshold)
+}
+
+// TC-03 (US-40): error_rate <= threshold → no alert.
+func TestErrorRateAlertBelowThreshold(t *testing.T) {
+	window := time.Minute
+	reader := &splitReader{
+		window:         window,
+		currentRecords: makeErrRecs("GET", "/x", 10, 1), // 10% errors
+	}
+	engine := metrics.NewEngine(reader, window)
+	d := alerts.NewDetector(engine, 999.0, 5)
+	d.SetErrorRateThreshold(10.0) // exactly 10% → NOT > 10%, no alert
+	d.Evaluate()
+	assert.Empty(t, d.Active())
+}
+
+// TC-04 (US-40): both latency and error_rate conditions → 2 alerts for same endpoint.
+func TestBothLatencyAndErrorRateAlerts(t *testing.T) {
+	window := time.Minute
+	reader := &splitReader{
+		window: window,
+		currentRecords: []storage.Record{
+			{Method: "GET", Path: "/x", StatusCode: 500, DurationMs: 400, Timestamp: time.Now()},
+			{Method: "GET", Path: "/x", StatusCode: 500, DurationMs: 400, Timestamp: time.Now()},
+			{Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 400, Timestamp: time.Now()},
+		},
+		baselineRecords: []storage.Record{
+			{Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 100, Timestamp: time.Now()},
+		},
+	}
+	engine := metrics.NewEngine(reader, window)
+	d := alerts.NewDetector(engine, 3.0, 5)
+	d.SetErrorRateThreshold(10.0) // 66% > 10% → error_rate alert
+	d.Evaluate()
+
+	active := d.Active()
+	require.Len(t, active, 2)
+	kinds := map[string]bool{active[0].Kind: true, active[1].Kind: true}
+	assert.True(t, kinds[alerts.KindLatency])
+	assert.True(t, kinds[alerts.KindErrorRate])
+}
+
+// TC-05 (US-40): error rate drops below threshold → error_rate alert auto-resolved.
+func TestErrorRateAlertAutoResolves(t *testing.T) {
+	window := time.Minute
+	reader := &splitReader{
+		window:         window,
+		currentRecords: makeErrRecs("GET", "/x", 10, 5), // 50% errors
+	}
+	engine := metrics.NewEngine(reader, window)
+	d := alerts.NewDetector(engine, 999.0, 5)
+	d.SetErrorRateThreshold(10.0)
+	d.Evaluate()
+	require.Len(t, d.Active(), 1)
+
+	reader.currentRecords = makeErrRecs("GET", "/x", 10, 0) // 0% errors
+	d.Evaluate()
+	assert.Empty(t, d.Active())
+}
+
+// --- US-41: Throughput drop alerts ---
+
+// makeTpRecs builds records with fixed duration to control RPS (count / window).
+func makeTpRecs(method, path string, count int) []storage.Record {
+	out := make([]storage.Record, count)
+	for i := range out {
+		out[i] = storage.Record{Method: method, Path: path, StatusCode: 200, DurationMs: 10, Timestamp: time.Now()}
+	}
+	return out
+}
+
+// newTpDetector builds a detector with high latency/error thresholds so only
+// the throughput condition is under test.
+func newTpDetector(dropPct float64, currentCount, baselineCount int) (*alerts.Detector, *splitReader) {
+	window := time.Minute
+	reader := &splitReader{
+		window:          window,
+		currentRecords:  makeTpRecs("GET", "/x", currentCount),
+		baselineRecords: makeTpRecs("GET", "/x", baselineCount),
+	}
+	engine := metrics.NewEngine(reader, window)
+	d := alerts.NewDetector(engine, 999.0, 1) // latency threshold very high
+	d.SetThroughputDropThreshold(dropPct)
+	return d, reader
+}
+
+// TC-01 (US-41): ThroughputDropThreshold=0 → disabled.
+func TestThroughputThresholdZeroDisabled(t *testing.T) {
+	window := time.Minute
+	reader := &splitReader{
+		window:          window,
+		currentRecords:  makeTpRecs("GET", "/x", 1),
+		baselineRecords: makeTpRecs("GET", "/x", 100),
+	}
+	engine := metrics.NewEngine(reader, window)
+	d := alerts.NewDetector(engine, 999.0, 1)
+	// SetThroughputDropThreshold NOT called → 0
+	d.Evaluate()
+	assert.Empty(t, d.Active())
+}
+
+// TC-02 (US-41): current RPS < threshold% of baseline → alert kind="throughput".
+func TestThroughputDropAlertFires(t *testing.T) {
+	// baseline=100 reqs/min → ~1.67 RPS; current=10 reqs → ~0.17 RPS
+	// threshold=50: alert when current < 50% of baseline (0.83 RPS) → fires
+	d, _ := newTpDetector(50.0, 10, 100)
+	d.Evaluate()
+
+	active := d.Active()
+	require.Len(t, active, 1)
+	assert.Equal(t, alerts.KindThroughput, active[0].Kind)
+	assert.Equal(t, "GET", active[0].Method)
+	assert.Less(t, active[0].CurrentRPS, active[0].BaselineRPS*active[0].DropPct/100)
+}
+
+// TC-03 (US-41): current RPS >= threshold% of baseline → no alert.
+func TestThroughputDropNoAlertAboveThreshold(t *testing.T) {
+	// baseline=100, current=80, threshold=50: 80/60 >= (100/60)*0.5 → no alert
+	d, _ := newTpDetector(50.0, 80, 100)
+	d.Evaluate()
+	assert.Empty(t, d.Active())
+}
+
+// TC-04 (US-41): endpoint disappears from current traffic (0 RPS) → alert.
+func TestThroughputDropZeroCurrentRPS(t *testing.T) {
+	window := time.Minute
+	reader := &splitReader{
+		window:          window,
+		currentRecords:  nil, // no traffic at all
+		baselineRecords: makeTpRecs("GET", "/x", 100),
+	}
+	engine := metrics.NewEngine(reader, window)
+	d := alerts.NewDetector(engine, 999.0, 1)
+	d.SetThroughputDropThreshold(50.0)
+	d.Evaluate()
+
+	active := d.Active()
+	require.Len(t, active, 1)
+	assert.Equal(t, alerts.KindThroughput, active[0].Kind)
+	assert.Equal(t, float64(0), active[0].CurrentRPS)
+}
+
+// TC-05 (US-41): RPS recovers → throughput alert auto-resolved.
+func TestThroughputDropAutoResolves(t *testing.T) {
+	d, reader := newTpDetector(50.0, 10, 100)
+	d.Evaluate()
+	require.Len(t, d.Active(), 1)
+
+	reader.currentRecords = makeTpRecs("GET", "/x", 80) // back above threshold
+	d.Evaluate()
+	assert.Empty(t, d.Active())
 }

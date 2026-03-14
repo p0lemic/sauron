@@ -14,6 +14,7 @@ import (
 	"api-profiler/alerts"
 	"api-profiler/api"
 	"api-profiler/config"
+	"api-profiler/health"
 	"api-profiler/metrics"
 	"api-profiler/storage"
 )
@@ -21,12 +22,15 @@ import (
 func main() {
 	configPath := flag.String("config", "", "path to YAML config file (optional)")
 	listenFlag := flag.String("listen", "", "dashboard listen address (default: :9090)")
+	upstreamFlag := flag.String("upstream", "", "upstream base URL for health check (e.g. http://localhost:8080)")
 	storageDriverFlag := flag.String("storage-driver", "", "storage driver: sqlite or postgres (default: sqlite)")
 	storageDSNFlag := flag.String("storage-dsn", "", "storage DSN: file path for sqlite, connection string for postgres (default: profiler.db)")
 	metricsWindowFlag := flag.Duration("metrics-window", 0, "metrics aggregation window (default: 30m)")
 	baselineWindowsFlag := flag.Int("baseline-windows", 0, "number of past windows used for baseline (default: 5)")
 	anomalyThresholdFlag := flag.Float64("anomaly-threshold", 0, "anomaly detection multiplier (default: 3.0)")
 	webhookURLFlag := flag.String("webhook-url", "", "URL to POST alert notifications to (optional)")
+	errorRateThresholdFlag := flag.Float64("error-rate-threshold", 0, "error rate % to trigger alert, e.g. 10.0 (0 = disabled)")
+	throughputDropFlag := flag.Float64("throughput-drop-threshold", 0, "min RPS % of baseline before alerting, e.g. 50.0 (0 = disabled)")
 
 	if cp := findConfigFlag(os.Args[1:]); cp != "" && *configPath == "" {
 		*configPath = cp
@@ -53,6 +57,8 @@ func main() {
 	var overrides config.Config
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
+		case "upstream":
+			overrides.Upstream = *upstreamFlag
 		case "listen":
 			overrides.APIAddr = *listenFlag
 		case "storage-driver":
@@ -67,6 +73,10 @@ func main() {
 			overrides.AnomalyThreshold = *anomalyThresholdFlag
 		case "webhook-url":
 			overrides.WebhookURL = *webhookURLFlag
+		case "error-rate-threshold":
+			overrides.ErrorRateThreshold = *errorRateThresholdFlag
+		case "throughput-drop-threshold":
+			overrides.ThroughputDropThreshold = *throughputDropFlag
 		}
 	})
 
@@ -89,9 +99,38 @@ func main() {
 	if cfg.WebhookURL != "" {
 		detector.SetNotifier(alerts.NewWebhookNotifier(cfg.WebhookURL))
 	}
+	if cfg.ErrorRateThreshold > 0 {
+		detector.SetErrorRateThreshold(cfg.ErrorRateThreshold)
+	}
+	if cfg.ThroughputDropThreshold > 0 {
+		detector.SetThroughputDropThreshold(cfg.ThroughputDropThreshold)
+	}
 	detector.Start()
 
-	apiSrv := api.NewServer(engine, cfg.APIAddr, cfg.BaselineWindows, detector)
+	var checker *health.Checker
+	if cfg.HealthCheck.Enabled && cfg.Upstream != "" {
+		path := cfg.HealthCheck.Path
+		if path == "" {
+			path = "/"
+		}
+		interval := cfg.HealthCheck.Interval
+		if interval == 0 {
+			interval = 10 * time.Second
+		}
+		timeout := cfg.HealthCheck.Timeout
+		if timeout == 0 {
+			timeout = 5 * time.Second
+		}
+		threshold := cfg.HealthCheck.Threshold
+		if threshold == 0 {
+			threshold = 3
+		}
+		checker = health.New(cfg.Upstream+path, interval, timeout, threshold)
+		checker.Start()
+		log.Printf("health check enabled: target=%s interval=%s", cfg.Upstream+path, interval)
+	}
+
+	apiSrv := api.NewServer(engine, cfg.APIAddr, cfg.BaselineWindows, detector, checker)
 	if err := apiSrv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: starting dashboard server: %v\n", err)
 		os.Exit(1)
@@ -107,6 +146,9 @@ func main() {
 	defer cancel()
 	if err := apiSrv.Shutdown(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error during dashboard shutdown: %v\n", err)
+	}
+	if checker != nil {
+		checker.Stop()
 	}
 	detector.Stop()
 	log.Println("shutdown complete")

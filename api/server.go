@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"api-profiler/alerts"
+	"api-profiler/health"
 	"api-profiler/metrics"
+	"api-profiler/storage"
 )
 
 //go:embed all:dashboard
@@ -23,6 +25,7 @@ type Server struct {
 	engine          *metrics.Engine
 	baselineWindows int
 	detector        *alerts.Detector
+	checker         *health.Checker // nil if health check disabled
 	srv             *http.Server
 	ln              net.Listener
 }
@@ -31,8 +34,9 @@ type Server struct {
 // addr is the listen address (e.g. "localhost:9090").
 // baselineWindows is the number of past windows used for baseline computation.
 // detector provides active alert data for GET /alerts/active.
-func NewServer(engine *metrics.Engine, addr string, baselineWindows int, detector *alerts.Detector) *Server {
-	s := &Server{engine: engine, baselineWindows: baselineWindows, detector: detector}
+// checker is optional (nil = disabled); when non-nil, GET /health includes upstream state.
+func NewServer(engine *metrics.Engine, addr string, baselineWindows int, detector *alerts.Detector, checker *health.Checker) *Server {
+	s := &Server{engine: engine, baselineWindows: baselineWindows, detector: detector, checker: checker}
 	mux := http.NewServeMux()
 	sub, _ := fs.Sub(dashboardFS, "dashboard")
 	mux.Handle("/static/", http.FileServer(http.FS(sub)))
@@ -50,7 +54,11 @@ func NewServer(engine *metrics.Engine, addr string, baselineWindows int, detecto
 	mux.HandleFunc("/alerts/history", s.handleAlertsHistory)
 	mux.HandleFunc("/alerts/silence", s.handleCreateSilence)
 	mux.HandleFunc("/alerts/silences", s.handleListSilences)
+	mux.HandleFunc("/metrics/requests", s.handleRequests)
+	mux.HandleFunc("/metrics/slowest-requests", s.handleSlowestRequests)
+	mux.HandleFunc("/metrics/status", s.handleStatus)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/metrics/prometheus", s.handlePrometheus)
 	s.srv = &http.Server{Addr: addr, Handler: mux}
 	return s
 }
@@ -445,7 +453,180 @@ func (s *Server) handleListSilences(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(silences) //nolint:errcheck
 }
 
+func (s *Server) handleSlowestRequests(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n := 10
+	if raw := r.URL.Query().Get("n"); raw != "" {
+		var err error
+		n, err = strconv.Atoi(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid n %q: %v", raw, err))
+			return
+		}
+	}
+	from, to, err := parseTimeRange(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var records []storage.Record
+	if from.IsZero() {
+		records, err = s.engine.SlowestRequests(n)
+	} else {
+		records, err = s.engine.SlowestRequestsForRange(from, to, n)
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if records == nil {
+		records = []storage.Record{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(records) //nolint:errcheck
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	method := r.URL.Query().Get("method")
+	path := r.URL.Query().Get("path")
+	if (method == "") != (path == "") {
+		writeJSONError(w, http.StatusBadRequest, "method and path are required together")
+		return
+	}
+	from, to, err := parseTimeRange(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var groups []metrics.StatusGroup
+	if method != "" {
+		if from.IsZero() {
+			groups, err = s.engine.StatusBreakdownForEndpoint(method, path)
+		} else {
+			groups, err = s.engine.StatusBreakdownForEndpointRange(method, path, from, to)
+		}
+	} else {
+		if from.IsZero() {
+			groups, err = s.engine.StatusBreakdown()
+		} else {
+			groups, err = s.engine.StatusBreakdownForRange(from, to)
+		}
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(groups) //nolint:errcheck
+}
+
+func (s *Server) handleRequests(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n := 100
+	if raw := r.URL.Query().Get("n"); raw != "" {
+		var err error
+		n, err = strconv.Atoi(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid n %q: %v", raw, err))
+			return
+		}
+	}
+	from, to, err := parseTimeRange(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var records []storage.Record
+	if from.IsZero() {
+		records, err = s.engine.Requests(n)
+	} else {
+		records, err = s.engine.RequestsForRange(from, to, n)
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if records == nil {
+		records = []storage.Record{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(records) //nolint:errcheck
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
+	if s.checker == nil {
+		w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
+		return
+	}
+	resp := struct {
+		Status   string       `json:"status"`
+		Upstream health.State `json:"upstream"`
+	}{
+		Status:   "ok",
+		Upstream: s.checker.State(),
+	}
+	json.NewEncoder(w).Encode(resp) //nolint:errcheck
+}
+
+func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rows, err := s.engine.Table()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+	type metric struct {
+		name string
+		help string
+		key  func(metrics.TableRow) float64
+	}
+	gauges := []metric{
+		{"apiprofiler_request_duration_p50_ms", "P50 request latency in milliseconds", func(r metrics.TableRow) float64 { return r.P50 }},
+		{"apiprofiler_request_duration_p95_ms", "P95 request latency in milliseconds", func(r metrics.TableRow) float64 { return r.P95 }},
+		{"apiprofiler_request_duration_p99_ms", "P99 request latency in milliseconds", func(r metrics.TableRow) float64 { return r.P99 }},
+		{"apiprofiler_request_error_rate", "Request error rate percentage (0-100)", func(r metrics.TableRow) float64 { return r.ErrorRate }},
+		{"apiprofiler_request_rps_current", "Current requests per second", func(r metrics.TableRow) float64 { return r.RPSCurrent }},
+		{"apiprofiler_request_total", "Total request count in current window", func(r metrics.TableRow) float64 { return float64(r.Count) }},
+	}
+
+	for _, g := range gauges {
+		fmt.Fprintf(w, "# HELP %s %s\n", g.name, g.help)
+		fmt.Fprintf(w, "# TYPE %s gauge\n", g.name)
+		for _, row := range rows {
+			fmt.Fprintf(w, "%s{method=%q,path=%q} %g\n", g.name, row.Method, row.Path, g.key(row))
+		}
+	}
+
+	// Active alerts counter by kind.
+	active := s.detector.Active()
+	counts := map[string]int{
+		alerts.KindLatency:    0,
+		alerts.KindErrorRate:  0,
+		alerts.KindThroughput: 0,
+	}
+	for _, a := range active {
+		counts[a.Kind]++
+	}
+	fmt.Fprintf(w, "# HELP apiprofiler_active_alerts_total Number of currently active alerts\n")
+	fmt.Fprintf(w, "# TYPE apiprofiler_active_alerts_total gauge\n")
+	for _, kind := range []string{alerts.KindLatency, alerts.KindErrorRate, alerts.KindThroughput} {
+		fmt.Fprintf(w, "apiprofiler_active_alerts_total{kind=%q} %d\n", kind, counts[kind])
+	}
 }

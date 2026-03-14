@@ -16,22 +16,53 @@ function escHtml(s) {
 // ── Time range state ──────────────────────────────────────────────────────────
 const _range = { from: null, to: null, live: true };
 let _pollTimer = null;
+let _preset = null; // { label: '1h', ms: 3600000 } or null
+
+const PRESET_MS = { '15m': 15*60e3, '1h': 3600e3, '6h': 6*3600e3, '24h': 24*3600e3, '7d': 7*24*3600e3 };
 
 function rangeParams() {
+  if (_preset) {
+    const now  = new Date();
+    const from = new Date(now - _preset.ms);
+    return `?from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(now.toISOString())}`;
+  }
   if (_range.live) return '';
   const from = _range.from ? new Date(_range.from).toISOString() : null;
   const to   = _range.to   ? new Date(_range.to).toISOString()   : new Date().toISOString();
   return from ? `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}` : '';
 }
 
+function setActivePreset(label) {
+  document.querySelectorAll('.tr-preset').forEach(b => {
+    b.classList.toggle('active', b.dataset.preset === label);
+  });
+}
+
 function initTimeRange() {
-  const btnApply = el('tr-apply');
-  const btnLive  = el('tr-live');
+  const btnApply  = el('tr-apply');
+  const btnLive   = el('tr-live');
   const inputFrom = el('tr-from');
   const inputTo   = el('tr-to');
   const bar       = el('timerange-bar');
 
+  // Preset buttons
+  document.querySelectorAll('.tr-preset').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const label = btn.dataset.preset;
+      _preset     = { label, ms: PRESET_MS[label] };
+      _range.live = false;
+      inputFrom.value = '';
+      inputTo.value   = '';
+      btnLive.classList.remove('active');
+      bar.classList.add('historical');
+      setActivePreset(label);
+      startPolling();
+      refresh();
+    });
+  });
+
   btnLive.addEventListener('click', () => {
+    _preset     = null;
     _range.live = true;
     _range.from = null;
     _range.to   = null;
@@ -39,6 +70,7 @@ function initTimeRange() {
     inputTo.value   = '';
     btnLive.classList.add('active');
     bar.classList.remove('historical');
+    setActivePreset(null);
     startPolling();
     refresh();
   });
@@ -47,11 +79,13 @@ function initTimeRange() {
     const f = inputFrom.value;
     const t = inputTo.value;
     if (!f) { inputFrom.focus(); return; }
+    _preset     = null;
     _range.live = false;
     _range.from = f;
-    _range.to   = t || null; // null = now
+    _range.to   = t || null;
     btnLive.classList.remove('active');
     bar.classList.add('historical');
+    setActivePreset(null);
     stopPolling();
     refresh();
   });
@@ -154,6 +188,15 @@ function renderTable() {
         COLS.map(c => `<td>${c.fmt(r[c.key], r)}</td>`).join('') + '</tr>'
       ).join('');
 
+  // If the table already exists, only update thead/tbody to preserve input focus.
+  const existingTable = body.querySelector('.data-table');
+  if (existingTable) {
+    existingTable.querySelector('thead tr').innerHTML = thCells;
+    existingTable.querySelector('tbody').innerHTML = trRows;
+    return;
+  }
+
+  // First render: build full structure and attach listeners via event delegation.
   body.innerHTML = `
     <div class="table-toolbar">
       <input id="ep-filter" class="filter-input" type="text"
@@ -170,27 +213,31 @@ function renderTable() {
     _filterText = e.target.value;
     renderTable();
   });
-  body.querySelectorAll('th.sortable').forEach(th => {
-    th.addEventListener('click', () => {
-      const col = th.dataset.col;
-      if (_sortCol === col) { _sortDir *= -1; }
-      else { _sortCol = col; _sortDir = -1; }
-      renderTable();
-    });
+
+  // Sort: single delegated listener on thead — survives innerHTML updates to tr.
+  body.querySelector('thead').addEventListener('click', e => {
+    const th = e.target.closest('th.sortable');
+    if (!th) return;
+    const col = th.dataset.col;
+    if (_sortCol === col) { _sortDir *= -1; }
+    else { _sortCol = col; _sortDir = -1; }
+    renderTable();
   });
-  body.querySelectorAll('tr.row-clickable').forEach(tr => {
-    tr.addEventListener('click', () => {
-      const method = tr.dataset.method;
-      const path   = tr.dataset.path;
-      if (_chartEndpoint && _chartEndpoint.method === method && _chartEndpoint.path === path) {
-        const panel = el('chart-panel');
-        if (panel) panel.style.display = 'none';
-        _chartEndpoint = null;
-      } else {
-        _chartEndpoint = { method, path };
-        fetchLatency(method, path);
-      }
-    });
+
+  // Row click: single delegated listener on tbody — survives tbody innerHTML updates.
+  body.querySelector('tbody').addEventListener('click', e => {
+    const tr = e.target.closest('tr.row-clickable');
+    if (!tr) return;
+    const method = tr.dataset.method;
+    const path   = tr.dataset.path;
+    if (_chartEndpoint && _chartEndpoint.method === method && _chartEndpoint.path === path) {
+      const panel = el('chart-panel');
+      if (panel) panel.style.display = 'none';
+      _chartEndpoint = null;
+    } else {
+      _chartEndpoint = { method, path };
+      fetchLatency(method, path);
+    }
   });
 }
 
@@ -288,6 +335,22 @@ function renderHistogram(stat) {
     <div class="hist-total">Total: ${fmt(stat.total_count)} requests</div>`;
 }
 
+function renderStatusTab(groups) {
+  const cards = groups.map(g => {
+    const { cls } = STATUS_COLORS[g.class] || { cls: '' };
+    return `
+      <div class="status-card">
+        <div class="status-card-class ${cls}">${g.class}</div>
+        <div class="status-card-count">${fmt(g.count)}</div>
+        <div class="status-card-rate ${cls}">${fmt(g.rate, 1)}%</div>
+        <div class="status-bar-wrap">
+          <div class="status-bar ${cls}" style="width:${g.rate.toFixed(1)}%"></div>
+        </div>
+      </div>`;
+  }).join('');
+  return `<div class="status-grid" style="padding:16px 20px">${cards}</div>`;
+}
+
 async function fetchLatency(method, path) {
   try {
     const rp = rangeParams();
@@ -314,6 +377,7 @@ async function fetchLatency(method, path) {
           <div class="panel-tabs">
             <button class="panel-tab active" data-tab="chart">Chart</button>
             <button class="panel-tab" data-tab="histogram">Histogram</button>
+            <button class="panel-tab" data-tab="status">Status</button>
           </div>
           <button class="chart-close" id="chart-close">×</button>
         </div>
@@ -323,6 +387,9 @@ async function fetchLatency(method, path) {
       </div>
       <div id="tab-histogram" class="panel-tab-content" style="display:none;padding:16px 20px">
         ${renderHistogram(histStat)}
+      </div>
+      <div id="tab-status" class="panel-tab-content" style="display:none">
+        <div class="placeholder" style="padding:16px 20px">loading…</div>
       </div>`;
 
     panel.style.display = '';
@@ -332,12 +399,24 @@ async function fetchLatency(method, path) {
       panel.style.display = 'none';
       _chartEndpoint = null;
     });
+
+    let _statusLoaded = false;
     panel.querySelectorAll('.panel-tab').forEach(btn => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', async () => {
         panel.querySelectorAll('.panel-tab').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         el('tab-chart').style.display     = btn.dataset.tab === 'chart'     ? '' : 'none';
         el('tab-histogram').style.display = btn.dataset.tab === 'histogram' ? '' : 'none';
+        el('tab-status').style.display    = btn.dataset.tab === 'status'    ? '' : 'none';
+        if (btn.dataset.tab === 'status' && !_statusLoaded) {
+          _statusLoaded = true;
+          try {
+            const res = await fetch(`/metrics/status${rp}${sep}method=${encodeURIComponent(method)}&path=${encodeURIComponent(path)}`);
+            if (res.ok) {
+              el('tab-status').innerHTML = renderStatusTab(await res.json());
+            }
+          } catch (_) { /* ignore */ }
+        }
       });
     });
   } catch (_) { /* ignore */ }
@@ -363,14 +442,35 @@ async function fetchAlerts() {
     badge.onclick = () => section.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
     const rows = alerts.map(a => {
-      const ratio     = a.baseline_p99 > 0 ? (a.current_p99 / a.baseline_p99).toFixed(1) : '—';
       const triggered = new Date(a.triggered_at).toLocaleTimeString();
+      const kindCls   = a.kind === 'error_rate' ? 'kind-error-rate'
+                       : a.kind === 'throughput' ? 'kind-throughput' : 'kind-latency';
+      const kindLabel = a.kind === 'error_rate' ? 'error rate'
+                       : a.kind === 'throughput' ? 'throughput' : 'latency';
+      let valueCells;
+      if (a.kind === 'error_rate') {
+        valueCells = `
+          <td class="danger">${fmt(a.error_rate,1)}<span class="cell-unit">%</span></td>
+          <td>&gt; ${fmt(a.error_rate_threshold,1)}<span class="cell-unit">%</span></td>
+          <td class="cell-time">—</td>`;
+      } else if (a.kind === 'throughput') {
+        const dropActual = a.baseline_rps > 0 ? (100 - a.current_rps / a.baseline_rps * 100).toFixed(1) : '—';
+        valueCells = `
+          <td class="danger">${Number(a.current_rps).toFixed(2)}<span class="cell-unit">rps</span></td>
+          <td>${Number(a.baseline_rps).toFixed(2)}<span class="cell-unit">rps</span></td>
+          <td class="danger">${dropActual}%↓</td>`;
+      } else {
+        const ratio = a.baseline_p99 > 0 ? (a.current_p99 / a.baseline_p99).toFixed(1) : '—';
+        valueCells = `
+          <td class="danger">${fmt(a.current_p99,1)}<span class="cell-unit">ms</span></td>
+          <td>${fmt(a.baseline_p99,1)}<span class="cell-unit">ms</span></td>
+          <td class="danger">${ratio}×</td>`;
+      }
       return `<tr>
+        <td><span class="kind-badge ${kindCls}">${kindLabel}</span></td>
         <td>${escHtml(a.method)}</td>
         <td><span class="cell-path">${escHtml(a.path)}</span></td>
-        <td class="danger">${fmt(a.current_p99,1)}<span class="cell-unit">ms</span></td>
-        <td>${fmt(a.baseline_p99,1)}<span class="cell-unit">ms</span></td>
-        <td class="danger">${ratio}×</td>
+        ${valueCells}
         <td class="cell-time">${triggered}</td>
       </tr>`;
     }).join('');
@@ -379,8 +479,8 @@ async function fetchAlerts() {
       <div class="table-wrap">
         <table class="data-table alerts-table">
           <thead><tr>
-            <th>Method</th><th>Path</th>
-            <th>Current P99</th><th>Baseline P99</th>
+            <th>Kind</th><th>Method</th><th>Path</th>
+            <th>Value</th><th>Threshold</th>
             <th>Ratio</th><th>Triggered</th>
           </tr></thead>
           <tbody>${rows}</tbody>
@@ -390,9 +490,202 @@ async function fetchAlerts() {
   } catch (_) { /* keep last known state */ }
 }
 
+// ── Status Breakdown (US-28) ──────────────────────────────────────────────────
+const STATUS_COLORS = {
+  '2xx': { cls: 'status-2xx', label: '2xx' },
+  '3xx': { cls: 'status-3xx', label: '3xx' },
+  '4xx': { cls: 'status-4xx', label: '4xx' },
+  '5xx': { cls: 'status-5xx', label: '5xx' },
+};
+
+async function fetchStatusBreakdown() {
+  try {
+    const res = await fetch('/metrics/status' + rangeParams());
+    if (!res.ok) return;
+    const groups = await res.json();
+    const body = el('status-breakdown').querySelector('.section-body');
+    if (!body) return;
+
+    const cards = groups.map(g => {
+      const { cls } = STATUS_COLORS[g.class] || { cls: '' };
+      return `
+        <div class="status-card">
+          <div class="status-card-class ${cls}">${g.class}</div>
+          <div class="status-card-count">${fmt(g.count)}</div>
+          <div class="status-card-rate ${cls}">${fmt(g.rate, 1)}%</div>
+          <div class="status-bar-wrap">
+            <div class="status-bar ${cls}" style="width:${g.rate.toFixed(1)}%"></div>
+          </div>
+        </div>`;
+    }).join('');
+
+    body.innerHTML = `<div class="status-grid">${cards}</div>`;
+  } catch (_) { /* keep last known state */ }
+}
+
+// ── Slowest Requests (US-29) ──────────────────────────────────────────────────
+function buildRequestRows(records) {
+  if (records.length === 0) {
+    return `<tr><td colspan="5" class="no-data">No data</td></tr>`;
+  }
+  return records.map(r => {
+    const t   = new Date(r.timestamp);
+    const hms = t.toLocaleTimeString('en-US', { hour12: false });
+    const ms  = String(t.getMilliseconds()).padStart(3, '0');
+    const cls = METHOD_COLORS[r.method] || 'badge-other';
+    const sc  = statusClass(r.status_code);
+    const durCls = r.duration_ms >= 1000 ? 'danger' : '';
+    return `<tr>
+      <td class="cell-time">${hms}.${ms}</td>
+      <td><span class="method-badge ${cls}">${escHtml(r.method)}</span></td>
+      <td><span class="cell-path">${escHtml(r.path)}</span></td>
+      <td class="cell-status ${sc}">${r.status_code}</td>
+      <td class="cell-dur ${durCls}">${Number(r.duration_ms).toFixed(1)}<span class="cell-unit">ms</span></td>
+    </tr>`;
+  }).join('');
+}
+
+async function fetchSlowestRequests() {
+  try {
+    const rp  = rangeParams();
+    const sep = rp ? '&' : '?';
+    const res = await fetch('/metrics/slowest-requests' + rp + sep + 'n=10');
+    if (!res.ok) return;
+    const records = await res.json();
+    const body = el('slowest-requests').querySelector('.section-body');
+    if (!body) return;
+    body.innerHTML = `
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr>
+            <th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th>
+          </tr></thead>
+          <tbody>${buildRequestRows(records)}</tbody>
+        </table>
+      </div>`;
+  } catch (_) { /* keep last known state */ }
+}
+
+// ── Request Log (US-27) ───────────────────────────────────────────────────────
+const RL_PAGE_SIZE = 20;
+let _rlData   = [];
+let _rlPath   = '';
+let _rlMethod = 'all';
+let _rlStatus = 'all';
+let _rlPage   = 0;
+
+const METHOD_COLORS = {
+  GET:    'badge-get',
+  POST:   'badge-post',
+  PUT:    'badge-put',
+  PATCH:  'badge-patch',
+  DELETE: 'badge-delete',
+};
+
+function statusClass(code) {
+  if (code >= 500) return 'status-5xx';
+  if (code >= 400) return 'status-4xx';
+  if (code >= 300) return 'status-3xx';
+  return 'status-2xx';
+}
+
+function renderRequestLog() {
+  const body = el('request-log').querySelector('.section-body');
+  if (!body) return;
+
+  const filtered = _rlData.filter(r => {
+    if (_rlPath   && !r.path.toLowerCase().includes(_rlPath.toLowerCase())) return false;
+    if (_rlMethod !== 'all' && r.method !== _rlMethod) return false;
+    if (_rlStatus !== 'all') {
+      if (Math.floor(r.status_code / 100) !== parseInt(_rlStatus[0])) return false;
+    }
+    return true;
+  });
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / RL_PAGE_SIZE));
+  if (_rlPage >= totalPages) _rlPage = totalPages - 1;
+
+  const start = _rlPage * RL_PAGE_SIZE;
+  const pageRows = filtered.slice(start, start + RL_PAGE_SIZE);
+  const trRows = buildRequestRows(pageRows);
+
+  const rangeStart = filtered.length === 0 ? 0 : start + 1;
+  const rangeEnd   = Math.min(start + RL_PAGE_SIZE, filtered.length);
+  const paginationInfo = `${rangeStart}–${rangeEnd} of ${filtered.length}`;
+
+  body.innerHTML = `
+    <div class="table-toolbar rl-toolbar">
+      <input id="rl-filter" class="filter-input" type="text"
+             placeholder="Filter path…" value="${escHtml(_rlPath)}" autocomplete="off">
+      <select id="rl-method" class="rl-select">
+        <option value="all">All Methods</option>
+        <option value="GET"    ${_rlMethod==='GET'    ?'selected':''}>GET</option>
+        <option value="POST"   ${_rlMethod==='POST'   ?'selected':''}>POST</option>
+        <option value="PUT"    ${_rlMethod==='PUT'    ?'selected':''}>PUT</option>
+        <option value="PATCH"  ${_rlMethod==='PATCH'  ?'selected':''}>PATCH</option>
+        <option value="DELETE" ${_rlMethod==='DELETE' ?'selected':''}>DELETE</option>
+      </select>
+      <select id="rl-status" class="rl-select">
+        <option value="all">All Status</option>
+        <option value="2xx" ${_rlStatus==='2xx'?'selected':''}>2xx</option>
+        <option value="3xx" ${_rlStatus==='3xx'?'selected':''}>3xx</option>
+        <option value="4xx" ${_rlStatus==='4xx'?'selected':''}>4xx</option>
+        <option value="5xx" ${_rlStatus==='5xx'?'selected':''}>5xx</option>
+      </select>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr>
+          <th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th>
+        </tr></thead>
+        <tbody>${trRows}</tbody>
+      </table>
+    </div>
+    <div class="pagination">
+      <button class="page-btn" id="rl-prev" ${_rlPage === 0 ? 'disabled' : ''}>← Prev</button>
+      <span class="page-info">${paginationInfo}</span>
+      <button class="page-btn" id="rl-next" ${_rlPage >= totalPages - 1 ? 'disabled' : ''}>Next →</button>
+    </div>`;
+
+  el('rl-filter').addEventListener('input', e => { _rlPath = e.target.value; _rlPage = 0; renderRequestLog(); });
+  el('rl-method').addEventListener('change', e => { _rlMethod = e.target.value; _rlPage = 0; renderRequestLog(); });
+  el('rl-status').addEventListener('change', e => { _rlStatus = e.target.value; _rlPage = 0; renderRequestLog(); });
+  el('rl-prev').addEventListener('click', () => { _rlPage--; renderRequestLog(); });
+  el('rl-next').addEventListener('click', () => { _rlPage++; renderRequestLog(); });
+}
+
+async function fetchRequests() {
+  try {
+    const rp  = rangeParams();
+    const sep = rp ? '&' : '?';
+    const res = await fetch('/metrics/requests' + rp + sep + 'n=100');
+    if (!res.ok) return;
+    _rlData = await res.json();
+    renderRequestLog();
+  } catch (_) { /* keep last known state */ }
+}
+
+// ── Upstream Health (US-39) ───────────────────────────────────────────────────
+const HEALTH_COLORS = { healthy: 'health-healthy', degraded: 'health-degraded', down: 'health-down', unknown: 'health-unknown' };
+
+async function fetchHealth() {
+  try {
+    const res = await fetch('/health');
+    if (!res.ok) return;
+    const d = await res.json();
+    const indicator = el('upstream-health');
+    if (!indicator || !d.upstream) { if (indicator) indicator.style.display = 'none'; return; }
+    const s = d.upstream;
+    const cls = HEALTH_COLORS[s.status] || 'health-unknown';
+    const latency = s.latency_ms > 0 ? ` <span class="health-latency">${Number(s.latency_ms).toFixed(0)}ms</span>` : '';
+    indicator.innerHTML = `upstream: <span class="${cls}">●</span> <span class="${cls}">${s.status}</span>${latency}`;
+    indicator.style.display = '';
+  } catch (_) { /* keep last known state */ }
+}
+
 // ── Refresh loop ──────────────────────────────────────────────────────────────
 async function refresh() {
-  await Promise.all([fetchSummary(), fetchEndpoints(), fetchAlerts()]);
+  await Promise.all([fetchSummary(), fetchStatusBreakdown(), fetchEndpoints(), fetchAlerts(), fetchSlowestRequests(), fetchRequests(), fetchHealth()]);
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
