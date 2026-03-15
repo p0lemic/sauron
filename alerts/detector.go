@@ -14,24 +14,30 @@ const (
 	KindLatency    = "latency"
 	KindErrorRate  = "error_rate"
 	KindThroughput = "throughput"
+	KindStatistical = "statistical"
 )
 
 // Alert describes an active anomaly for one endpoint.
 type Alert struct {
-	Kind               string    `json:"kind"` // "latency" | "error_rate"
+	Kind               string    `json:"kind"` // "latency" | "error_rate" | "throughput" | "statistical"
 	Method             string    `json:"method"`
 	Path               string    `json:"path"`
-	// Latency-specific (zero for error_rate alerts).
+	// Latency-specific (zero for other kinds).
 	CurrentP99         float64   `json:"current_p99"`
 	BaselineP99        float64   `json:"baseline_p99"`
 	Threshold          float64   `json:"threshold"`
-	// Error-rate-specific (zero for latency/throughput alerts).
+	// Error-rate-specific.
 	ErrorRate          float64   `json:"error_rate"`
 	ErrorRateThreshold float64   `json:"error_rate_threshold"`
-	// Throughput-specific (zero for latency/error_rate alerts).
+	// Throughput-specific.
 	CurrentRPS  float64   `json:"current_rps"`
 	BaselineRPS float64   `json:"baseline_rps"`
-	DropPct     float64   `json:"drop_pct"` // configured threshold
+	DropPct     float64   `json:"drop_pct"`
+	// Statistical-specific.
+	ZScore    float64 `json:"z_score"`
+	MeanP99   float64 `json:"mean_p99"`
+	StddevP99 float64 `json:"stddev_p99"`
+	Sensitivity float64 `json:"sensitivity"`
 	TriggeredAt time.Time `json:"triggered_at"`
 }
 
@@ -44,7 +50,9 @@ type Detector struct {
 	baselineWindows         int
 	errorRateThreshold      float64
 	throughputDropThreshold float64
-	notifier                Notifier
+	sensitivity             float64 // z-score threshold for statistical alerts
+	statisticalWindows      int     // number of historical windows for z-score
+	notifier                ResolveNotifier
 
 	mu       sync.Mutex
 	active   map[string]*Alert   // key: "kind:METHOD:path"
@@ -71,10 +79,30 @@ func NewDetector(engine *metrics.Engine, threshold float64, baselineWindows int)
 	}
 }
 
-// SetNotifier registers a Notifier to be called when a new alert is created.
+// SetNotifier registers a legacy Notifier (backward compat).
 // Must be called before Start(). Safe to call with nil to clear the notifier.
 func (d *Detector) SetNotifier(n Notifier) {
+	if n == nil {
+		d.notifier = nil
+		return
+	}
+	d.notifier = &notifierAdapter{n}
+}
+
+// SetMultiNotifier registers a ResolveNotifier that receives both fired and resolved events.
+func (d *Detector) SetMultiNotifier(n ResolveNotifier) {
 	d.notifier = n
+}
+
+// SetStatisticalParams configures statistical anomaly detection.
+// sensitivity is the z-score threshold (default 2.0); windows is the number
+// of historical windows used to compute mean/stddev (minimum 3).
+func (d *Detector) SetStatisticalParams(sensitivity float64, windows int) {
+	d.sensitivity = sensitivity
+	if windows < 3 {
+		windows = 3
+	}
+	d.statisticalWindows = windows
 }
 
 // SetErrorRateThreshold sets the error rate percentage that triggers an alert.
@@ -323,7 +351,52 @@ func (d *Detector) Evaluate() {
 		}
 	}
 
+	// ── Statistical anomaly check ────────────────────────────────────────────
+	if d.sensitivity > 0 && d.statisticalWindows >= 3 {
+		d.mu.Unlock()
+		scores, sErr := d.engine.AnomalyScores(d.statisticalWindows)
+		d.mu.Lock()
+		if sErr == nil {
+			for _, s := range scores {
+				if !s.HasBaseline || s.ZScore <= d.sensitivity {
+					continue
+				}
+				silenceKey := s.Method + ":" + s.Path
+				if sv, ok := d.silences[silenceKey]; ok && now.Before(sv.ExpiresAt) {
+					continue
+				}
+				statKey := KindStatistical + ":" + s.Method + ":" + s.Path
+				triggered[statKey] = struct{}{}
+				_, wasActive := d.active[statKey]
+				a := &Alert{
+					Kind:        KindStatistical,
+					Method:      s.Method,
+					Path:        s.Path,
+					CurrentP99:  s.CurrentP99,
+					MeanP99:     s.MeanP99,
+					StddevP99:   s.StddevP99,
+					ZScore:      s.ZScore,
+					Sensitivity: d.sensitivity,
+					TriggeredAt: now,
+				}
+				d.active[statKey] = a
+				if !wasActive {
+					newAlerts = append(newAlerts, *a)
+					d.history = append(d.history, &AlertRecord{
+						Kind:        KindStatistical,
+						Method:      s.Method,
+						Path:        s.Path,
+						CurrentP99:  s.CurrentP99,
+						ZScore:      s.ZScore,
+						TriggeredAt: now,
+					})
+				}
+			}
+		}
+	}
+
 	// Auto-resolve: remove alerts whose condition is no longer true.
+	var resolvedAlerts []Alert
 	for k, a := range d.active {
 		if _, ok := triggered[k]; !ok {
 			for i := len(d.history) - 1; i >= 0; i-- {
@@ -337,6 +410,7 @@ func (d *Detector) Evaluate() {
 					break
 				}
 			}
+			resolvedAlerts = append(resolvedAlerts, *a)
 			delete(d.active, k)
 		}
 	}
@@ -345,7 +419,10 @@ func (d *Detector) Evaluate() {
 	// Fire notifier outside the lock to avoid holding it during I/O.
 	if d.notifier != nil {
 		for _, a := range newAlerts {
-			d.notifier.Notify(a)
+			d.notifier.NotifyFired(a)
+		}
+		for _, a := range resolvedAlerts {
+			d.notifier.NotifyResolved(a, now)
 		}
 	}
 }

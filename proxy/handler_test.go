@@ -833,3 +833,129 @@ func TestRewriteHeadersOrder(t *testing.T) {
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 	assert.Empty(t, getHeaders().Get("X-Temp"))
 }
+
+// --- US-45: W3C TraceContext ---
+
+// newHandlerWithTraceContext creates a proxy Handler with TraceContext enabled and a capturing store.
+func newHandlerWithTraceContext(t *testing.T, upstream *url.URL, enabled bool) (*proxy.Handler, *capturingStore) {
+	t.Helper()
+	store := &capturingStore{}
+	rec := storage.NewRecorder(store, 100)
+	t.Cleanup(func() { rec.Close() })
+	h, err := proxy.New(proxy.Config{Upstream: upstream, Recorder: rec, TraceContext: enabled})
+	require.NoError(t, err)
+	return h, store
+}
+
+// TC-07: Request sin traceparent → proxy genera trace_id y lo propaga al upstream.
+func TestTraceContextGeneratesWhenAbsent(t *testing.T) {
+	var receivedTraceparent string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedTraceparent = r.Header.Get("Traceparent")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	h, store := newHandlerWithTraceContext(t, upstreamURL, true)
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	// Upstream must receive a valid traceparent.
+	assert.NotEmpty(t, receivedTraceparent)
+	parts := strings.Split(receivedTraceparent, "-")
+	require.Len(t, parts, 4)
+	assert.Len(t, parts[1], 32) // trace-id
+	assert.Len(t, parts[2], 16) // span-id
+
+	// Record must have non-empty trace_id and span_id.
+	time.Sleep(50 * time.Millisecond) // let recorder drain
+	records := store.all()
+	require.Len(t, records, 1)
+	assert.Len(t, records[0].TraceID, 32)
+	assert.Len(t, records[0].SpanID, 16)
+}
+
+// TC-08: Request con traceparent válido → proxy reutiliza trace-id, genera nuevo span-id.
+func TestTraceContextPreservesTraceID(t *testing.T) {
+	const incomingTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	var receivedTraceparent string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedTraceparent = r.Header.Get("Traceparent")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	h, store := newHandlerWithTraceContext(t, upstreamURL, true)
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Traceparent", "00-"+incomingTraceID+"-00f067aa0ba902b7-01")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	// Upstream trace-id must match incoming.
+	parts := strings.Split(receivedTraceparent, "-")
+	require.Len(t, parts, 4)
+	assert.Equal(t, incomingTraceID, parts[1])
+
+	// Span-id must be freshly generated (different from incoming parent-id).
+	assert.NotEqual(t, "00f067aa0ba902b7", parts[2])
+
+	time.Sleep(50 * time.Millisecond)
+	records := store.all()
+	require.Len(t, records, 1)
+	assert.Equal(t, incomingTraceID, records[0].TraceID)
+}
+
+// TC-09: Request con traceparent inválido → proxy genera nuevo trace-id.
+func TestTraceContextIgnoresBadHeader(t *testing.T) {
+	var receivedTraceparent string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedTraceparent = r.Header.Get("Traceparent")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	h, _ := newHandlerWithTraceContext(t, upstreamURL, true)
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Traceparent", "not-valid-at-all")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	// Upstream must receive a freshly generated (valid) traceparent.
+	assert.NotEmpty(t, receivedTraceparent)
+	assert.NotEqual(t, "not-valid-at-all", receivedTraceparent)
+	parts := strings.Split(receivedTraceparent, "-")
+	require.Len(t, parts, 4)
+	assert.Len(t, parts[1], 32)
+}
+
+// TC-10: TraceContext=false → proxy no añade traceparent; trace_id en Record vacío.
+func TestTraceContextDisabled(t *testing.T) {
+	var receivedTraceparent string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedTraceparent = r.Header.Get("Traceparent")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	h, store := newHandlerWithTraceContext(t, upstreamURL, false)
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	assert.Empty(t, receivedTraceparent)
+
+	time.Sleep(50 * time.Millisecond)
+	records := store.all()
+	require.Len(t, records, 1)
+	assert.Empty(t, records[0].TraceID)
+	assert.Empty(t, records[0].SpanID)
+}

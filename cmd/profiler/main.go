@@ -29,6 +29,7 @@ func main() {
 	storageDriverFlag := flag.String("storage-driver", "", "storage driver: sqlite or postgres (default: sqlite)")
 	storageDSNFlag := flag.String("storage-dsn", "", "storage DSN: file path for sqlite, connection string for postgres (default: profiler.db)")
 	retentionFlag := flag.Duration("retention", 0, "how long to keep request records, e.g. 7d, 24h (default: 0 = disabled)")
+	noTraceContextFlag := flag.Bool("no-trace-context", false, "disable W3C TraceContext header propagation")
 
 	if cp := findConfigFlag(os.Args[1:]); cp != "" && *configPath == "" {
 		*configPath = cp
@@ -73,6 +74,10 @@ func main() {
 	})
 
 	cfg := config.Merge(base, overrides)
+	// --no-trace-context toggles a default-true bool; handle outside Merge.
+	if *noTraceContextFlag {
+		cfg.TraceContext = false
+	}
 	if err := config.Validate(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		flag.Usage()
@@ -124,6 +129,10 @@ func main() {
 		log.Printf("data retention enabled: %s", cfg.Retention)
 	}
 
+	// Statistical anomaly detection is only in the dashboard binary, but the
+	// profiler binary can still be extended here if needed in the future.
+	_ = cfg.AnomalySensitivity // suppress unused-field warning
+
 	rec := storage.NewRecorder(store, 0)
 
 	h, err := proxy.New(proxy.Config{
@@ -134,6 +143,7 @@ func main() {
 		TLSSkipVerify:  cfg.TLSSkipVerify,
 		Normalizer:     normFn,
 		RewriteHeaders: rewriteFn,
+		TraceContext:   cfg.TraceContext,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

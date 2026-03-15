@@ -1063,3 +1063,211 @@ func TestStatusBreakdownForRange(t *testing.T) {
 	assert.Equal(t, 1, groups[0].Count) // 2xx
 	assert.Equal(t, 1, groups[3].Count) // 5xx
 }
+
+// --- US-44: Apdex score ---
+
+// TC-01: Cálculo básico correcto: 6 satisfied, 3 tolerating, 1 frustrated → 0.750.
+func TestApdexBasicCalculation(t *testing.T) {
+	const T = 500.0
+	records := []storage.Record{
+		rec("GET", "/api", 100), // satisfied
+		rec("GET", "/api", 200), // satisfied
+		rec("GET", "/api", 300), // satisfied
+		rec("GET", "/api", 400), // satisfied
+		rec("GET", "/api", 450), // satisfied
+		rec("GET", "/api", 500), // satisfied (== T)
+		rec("GET", "/api", 600), // tolerating
+		rec("GET", "/api", 800), // tolerating
+		rec("GET", "/api", 1999), // tolerating (<= 4T=2000)
+		rec("GET", "/api", 2001), // frustrated (> 4T)
+	}
+	e := newEngine(records, time.Minute)
+	stats, err := e.Apdex(T)
+	require.NoError(t, err)
+	require.Len(t, stats, 1)
+	// (6 + 3/2) / 10 = 7.5/10 = 0.750
+	assert.Equal(t, 0.75, stats[0].Apdex)
+	assert.Equal(t, 6, stats[0].Satisfied)
+	assert.Equal(t, 3, stats[0].Tolerating)
+	assert.Equal(t, 1, stats[0].Frustrated)
+	assert.Equal(t, 10, stats[0].Total)
+}
+
+// TC-02: Todos satisfied → Apdex 1.000.
+func TestApdexAllSatisfied(t *testing.T) {
+	records := []storage.Record{
+		rec("GET", "/x", 10),
+		rec("GET", "/x", 20),
+		rec("GET", "/x", 30),
+		rec("GET", "/x", 40),
+		rec("GET", "/x", 50),
+	}
+	e := newEngine(records, time.Minute)
+	stats, err := e.Apdex(500)
+	require.NoError(t, err)
+	require.Len(t, stats, 1)
+	assert.Equal(t, 1.0, stats[0].Apdex)
+}
+
+// TC-03: Todos frustrated → Apdex 0.000.
+func TestApdexAllFrustrated(t *testing.T) {
+	records := []storage.Record{
+		rec("GET", "/x", 3000), // > 4*500=2000
+		rec("GET", "/x", 5000),
+	}
+	e := newEngine(records, time.Minute)
+	stats, err := e.Apdex(500)
+	require.NoError(t, err)
+	require.Len(t, stats, 1)
+	assert.Equal(t, 0.0, stats[0].Apdex)
+}
+
+// TC-04: Sin registros → slice vacío.
+func TestApdexEmpty(t *testing.T) {
+	e := newEngine(nil, time.Minute)
+	stats, err := e.Apdex(500)
+	require.NoError(t, err)
+	assert.Empty(t, stats)
+}
+
+// TC-05: Múltiples endpoints ordenados por Apdex ascendente.
+func TestApdexSortedAscending(t *testing.T) {
+	records := []storage.Record{
+		rec("GET", "/good", 10),  // satisfied → apdex 1.0
+		rec("GET", "/bad", 3000), // frustrated → apdex 0.0
+		rec("GET", "/mid", 600),  // tolerating → apdex 0.5
+	}
+	e := newEngine(records, time.Minute)
+	stats, err := e.Apdex(500)
+	require.NoError(t, err)
+	require.Len(t, stats, 3)
+	assert.Equal(t, 0.0, stats[0].Apdex)   // /bad first
+	assert.Equal(t, 0.5, stats[1].Apdex)   // /mid second
+	assert.Equal(t, 1.0, stats[2].Apdex)   // /good last
+}
+
+// TC-06: ApdexForRange respeta el rango — registros fuera no cuentan.
+func TestApdexForRange(t *testing.T) {
+	now := time.Now()
+	records := []storage.Record{
+		{Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 3000, Timestamp: now.Add(-30 * time.Second)},
+	}
+	e := newEngine(records, time.Minute)
+	// Rango que incluye los registros
+	stats, err := e.ApdexForRange(500, now.Add(-time.Minute), now)
+	require.NoError(t, err)
+	require.Len(t, stats, 1)
+	assert.Equal(t, 0.0, stats[0].Apdex)
+}
+
+// --- US-46: Error fingerprinting ---
+
+// TC-01: Fingerprint básico — rate y percentiles correctos.
+func TestErrorFingerprintsBasic(t *testing.T) {
+	now := time.Now()
+	records := []storage.Record{
+		{Method: "GET", Path: "/users/{id}", StatusCode: 503, DurationMs: 100, Timestamp: now},
+		{Method: "GET", Path: "/users/{id}", StatusCode: 503, DurationMs: 200, Timestamp: now},
+		{Method: "GET", Path: "/users/{id}", StatusCode: 503, DurationMs: 300, Timestamp: now},
+		{Method: "GET", Path: "/users/{id}", StatusCode: 200, DurationMs: 50, Timestamp: now},
+		{Method: "GET", Path: "/users/{id}", StatusCode: 200, DurationMs: 50, Timestamp: now},
+	}
+	e := newEngine(records, time.Minute)
+	fps, err := e.ErrorFingerprints()
+	require.NoError(t, err)
+	require.Len(t, fps, 1)
+	assert.Equal(t, "GET", fps[0].Method)
+	assert.Equal(t, "/users/{id}", fps[0].Path)
+	assert.Equal(t, 503, fps[0].StatusCode)
+	assert.Equal(t, 3, fps[0].Count)
+	assert.InDelta(t, 60.0, fps[0].Rate, 0.1) // 3/5 = 60%
+	assert.Equal(t, 200.0, fps[0].P50Ms)
+	assert.Equal(t, 300.0, fps[0].P95Ms)
+}
+
+// TC-02: Dos fingerprints distintos para el mismo endpoint, ordenados por count desc.
+func TestErrorFingerprintsTwoForSameEndpoint(t *testing.T) {
+	now := time.Now()
+	records := []storage.Record{
+		{Method: "GET", Path: "/orders", StatusCode: 422, DurationMs: 10, Timestamp: now},
+		{Method: "GET", Path: "/orders", StatusCode: 422, DurationMs: 10, Timestamp: now},
+		{Method: "GET", Path: "/orders", StatusCode: 503, DurationMs: 10, Timestamp: now},
+	}
+	e := newEngine(records, time.Minute)
+	fps, err := e.ErrorFingerprints()
+	require.NoError(t, err)
+	require.Len(t, fps, 2)
+	// Sorted by count desc: 422 (2) then 503 (1).
+	assert.Equal(t, 422, fps[0].StatusCode)
+	assert.Equal(t, 503, fps[1].StatusCode)
+}
+
+// TC-03: Rate calculada sobre total del endpoint propio, no global.
+func TestErrorFingerprintsRatePerEndpoint(t *testing.T) {
+	now := time.Now()
+	records := []storage.Record{
+		{Method: "GET", Path: "/a", StatusCode: 500, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 1, Timestamp: now},
+		// /b has 10 requests, none errors; should not affect /a's rate
+		{Method: "GET", Path: "/b", StatusCode: 200, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/b", StatusCode: 200, DurationMs: 1, Timestamp: now},
+		{Method: "GET", Path: "/b", StatusCode: 200, DurationMs: 1, Timestamp: now},
+	}
+	e := newEngine(records, time.Minute)
+	fps, err := e.ErrorFingerprints()
+	require.NoError(t, err)
+	require.Len(t, fps, 1)
+	// /a has 1 error out of 2 total → rate = 50%
+	assert.InDelta(t, 50.0, fps[0].Rate, 0.1)
+}
+
+// TC-04: is_new=true cuando first_seen está en el último 10% de la ventana.
+func TestErrorFingerprintsIsNewTrue(t *testing.T) {
+	now := time.Now()
+	// Window of 60s, first_seen at 55s into the window (> 90% = 54s threshold)
+	from := now.Add(-60 * time.Second)
+	firstSeen := from.Add(55 * time.Second) // 55s into 60s window → after 90% (54s)
+	records := []storage.Record{
+		{Method: "GET", Path: "/x", StatusCode: 500, DurationMs: 1, Timestamp: firstSeen},
+	}
+	e := newEngine(records, time.Minute)
+	fps, err := e.ErrorFingerprintsForRange(from, now)
+	require.NoError(t, err)
+	require.Len(t, fps, 1)
+	assert.True(t, fps[0].IsNew)
+}
+
+// TC-05: is_new=false cuando first_seen está al principio de la ventana.
+func TestErrorFingerprintsIsNewFalse(t *testing.T) {
+	now := time.Now()
+	from := now.Add(-60 * time.Second)
+	firstSeen := from.Add(5 * time.Second) // only 5s in → not new
+	records := []storage.Record{
+		{Method: "GET", Path: "/x", StatusCode: 500, DurationMs: 1, Timestamp: firstSeen},
+	}
+	e := newEngine(records, time.Minute)
+	fps, err := e.ErrorFingerprintsForRange(from, now)
+	require.NoError(t, err)
+	require.Len(t, fps, 1)
+	assert.False(t, fps[0].IsNew)
+}
+
+// TC-06: Requests 2xx/3xx no generan fingerprints.
+func TestErrorFingerprintsOnlyErrors(t *testing.T) {
+	records := []storage.Record{
+		{Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 1, Timestamp: time.Now()},
+		{Method: "GET", Path: "/x", StatusCode: 301, DurationMs: 1, Timestamp: time.Now()},
+	}
+	e := newEngine(records, time.Minute)
+	fps, err := e.ErrorFingerprints()
+	require.NoError(t, err)
+	assert.Empty(t, fps)
+}
+
+// TC-07: Ventana vacía → slice vacío.
+func TestErrorFingerprintsEmpty(t *testing.T) {
+	e := newEngine(nil, time.Minute)
+	fps, err := e.ErrorFingerprints()
+	require.NoError(t, err)
+	assert.Empty(t, fps)
+}

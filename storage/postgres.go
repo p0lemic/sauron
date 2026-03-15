@@ -42,6 +42,8 @@ func migratePG(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_path_method ON requests (method, path)`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_timestamp   ON requests (timestamp)`,
+		`ALTER TABLE requests ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN IF NOT EXISTS span_id  TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -53,13 +55,15 @@ func migratePG(db *sql.DB) error {
 
 func (s *postgresStore) Save(r Record) error {
 	_, err := s.db.Exec(
-		`INSERT INTO requests (timestamp, method, path, status_code, duration_ms)
-		 VALUES ($1, $2, $3, $4, $5)`,
+		`INSERT INTO requests (timestamp, method, path, status_code, duration_ms, trace_id, span_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		r.Timestamp.UTC(),
 		r.Method,
 		r.Path,
 		r.StatusCode,
 		r.DurationMs,
+		r.TraceID,
+		r.SpanID,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: insert: %w", err)
@@ -69,7 +73,7 @@ func (s *postgresStore) Save(r Record) error {
 
 func (s *postgresStore) FindByWindow(from, to time.Time) ([]Record, error) {
 	rows, err := s.db.Query(
-		`SELECT timestamp, method, path, status_code, duration_ms
+		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id
 		 FROM requests
 		 WHERE timestamp >= $1 AND timestamp < $2
 		 ORDER BY timestamp`,
@@ -85,7 +89,7 @@ func (s *postgresStore) FindByWindow(from, to time.Time) ([]Record, error) {
 	for rows.Next() {
 		var rec Record
 		var ts time.Time
-		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs); err != nil {
+		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs, &rec.TraceID, &rec.SpanID); err != nil {
 			return nil, fmt.Errorf("storage: scan: %w", err)
 		}
 		rec.Timestamp = ts.UTC()
@@ -96,7 +100,7 @@ func (s *postgresStore) FindByWindow(from, to time.Time) ([]Record, error) {
 
 func (s *postgresStore) FindRecent(from, to time.Time, limit int) ([]Record, error) {
 	rows, err := s.db.Query(
-		`SELECT timestamp, method, path, status_code, duration_ms
+		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id
 		 FROM requests
 		 WHERE timestamp >= $1 AND timestamp < $2
 		 ORDER BY timestamp DESC
@@ -114,7 +118,7 @@ func (s *postgresStore) FindRecent(from, to time.Time, limit int) ([]Record, err
 	for rows.Next() {
 		var rec Record
 		var ts time.Time
-		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs); err != nil {
+		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs, &rec.TraceID, &rec.SpanID); err != nil {
 			return nil, fmt.Errorf("storage: FindRecent scan: %w", err)
 		}
 		rec.Timestamp = ts.UTC()

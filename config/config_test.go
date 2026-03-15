@@ -726,3 +726,30 @@ func TestValidateHeaderRuleSetEmptyValue(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "value")
 }
+
+// TC-11 (US-44): metrics_apdex_t en YAML se parsea correctamente.
+func TestLoadApdexT(t *testing.T) {
+	path := writeYAML(t, `
+upstream: http://localhost:3000
+metrics_apdex_t: 250
+`)
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 250, cfg.ApdexT)
+}
+
+// TC-11b (US-44): ApdexT default es 500 cuando no se especifica en YAML.
+func TestLoadApdexTDefault(t *testing.T) {
+	path := writeYAML(t, `upstream: http://localhost:3000`)
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 500, cfg.ApdexT)
+}
+
+// TC-12 (US-44): Merge propaga ApdexT desde overrides.
+func TestMergeApdexT(t *testing.T) {
+	base := config.Default()
+	overrides := config.Config{ApdexT: 250}
+	result := config.Merge(base, overrides)
+	assert.Equal(t, 250, result.ApdexT)
+}

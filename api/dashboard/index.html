@@ -42,6 +42,19 @@
 
   <main>
 
+    <section id="heatmap">
+      <div class="section-header">
+        <span class="section-title"><span class="dot"></span>Traffic Heatmap</span>
+        <div class="panel-tabs" id="heatmap-tabs">
+          <button class="panel-tab active" data-metric="rps">RPS</button>
+          <button class="panel-tab" data-metric="error_rate">Error Rate</button>
+        </div>
+      </div>
+      <div class="section-body">
+        <div class="placeholder">loading heatmap…</div>
+      </div>
+    </section>
+
     <section id="summary">
       <div class="section-header">
         <span class="section-title"><span class="dot"></span>Overview</span>
@@ -60,6 +73,23 @@
       </div>
     </section>
 
+    <section id="error-fingerprints">
+      <div class="section-header">
+        <span class="section-title"><span class="dot dot-warn"></span>Error Fingerprints</span>
+      </div>
+      <div class="section-body">
+        <div class="placeholder">loading error fingerprints…</div>
+      </div>
+    </section>
+
+    <section id="alert-history" style="display:none">
+      <div class="section-header">
+        <span class="section-title"><span class="dot dot-warn"></span>Alert History</span>
+        <div class="panel-tabs" id="ah-kind-tabs"></div>
+      </div>
+      <div class="section-body"></div>
+    </section>
+
     <section id="alerts" style="display:none">
       <div class="section-header">
         <span class="section-title"><span class="dot dot-danger"></span>Active Alerts</span>
@@ -76,21 +106,19 @@
       </div>
     </section>
 
-    <section id="slowest-requests">
+    <section id="requests-section">
       <div class="section-header">
-        <span class="section-title"><span class="dot"></span>Slowest Requests</span>
+        <span class="section-title"><span class="dot"></span>Requests</span>
+        <div class="panel-tabs" id="requests-tabs">
+          <button class="panel-tab active" data-tab="log">Log</button>
+          <button class="panel-tab" data-tab="slowest">Slowest</button>
+        </div>
       </div>
-      <div class="section-body">
-        <div class="placeholder">loading slowest requests…</div>
-      </div>
-    </section>
-
-    <section id="request-log">
-      <div class="section-header">
-        <span class="section-title"><span class="dot"></span>Request Log</span>
-      </div>
-      <div class="section-body">
+      <div id="requests-tab-log">
         <div class="placeholder">loading request log…</div>
+      </div>
+      <div id="requests-tab-slowest" style="display:none">
+        <div class="placeholder">loading slowest requests…</div>
       </div>
     </section>
 

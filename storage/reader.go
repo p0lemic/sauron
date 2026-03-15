@@ -21,7 +21,7 @@ type StoreReader interface {
 // FindRecent returns up to limit records in [from, to), newest first.
 func (s *sqliteStore) FindRecent(from, to time.Time, limit int) ([]Record, error) {
 	rows, err := s.db.Query(
-		`SELECT timestamp, method, path, status_code, duration_ms
+		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id
 		 FROM requests
 		 WHERE timestamp >= ? AND timestamp < ?
 		 ORDER BY timestamp DESC
@@ -39,7 +39,7 @@ func (s *sqliteStore) FindRecent(from, to time.Time, limit int) ([]Record, error
 	for rows.Next() {
 		var r Record
 		var ts string
-		if err := rows.Scan(&ts, &r.Method, &r.Path, &r.StatusCode, &r.DurationMs); err != nil {
+		if err := rows.Scan(&ts, &r.Method, &r.Path, &r.StatusCode, &r.DurationMs, &r.TraceID, &r.SpanID); err != nil {
 			return nil, fmt.Errorf("storage: FindRecent scan: %w", err)
 		}
 		r.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
@@ -57,7 +57,7 @@ func (s *sqliteStore) FindRecent(from, to time.Time, limit int) ([]Record, error
 // FindByWindow returns all records with timestamp in [from, to), ordered by timestamp.
 func (s *sqliteStore) FindByWindow(from, to time.Time) ([]Record, error) {
 	rows, err := s.db.Query(
-		`SELECT timestamp, method, path, status_code, duration_ms
+		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id
 		 FROM requests
 		 WHERE timestamp >= ? AND timestamp < ?
 		 ORDER BY timestamp`,
@@ -73,7 +73,7 @@ func (s *sqliteStore) FindByWindow(from, to time.Time) ([]Record, error) {
 	for rows.Next() {
 		var r Record
 		var ts string
-		if err := rows.Scan(&ts, &r.Method, &r.Path, &r.StatusCode, &r.DurationMs); err != nil {
+		if err := rows.Scan(&ts, &r.Method, &r.Path, &r.StatusCode, &r.DurationMs, &r.TraceID, &r.SpanID); err != nil {
 			return nil, fmt.Errorf("storage: FindByWindow scan: %w", err)
 		}
 		r.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)

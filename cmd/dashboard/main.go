@@ -31,6 +31,7 @@ func main() {
 	webhookURLFlag := flag.String("webhook-url", "", "URL to POST alert notifications to (optional)")
 	errorRateThresholdFlag := flag.Float64("error-rate-threshold", 0, "error rate % to trigger alert, e.g. 10.0 (0 = disabled)")
 	throughputDropFlag := flag.Float64("throughput-drop-threshold", 0, "min RPS % of baseline before alerting, e.g. 50.0 (0 = disabled)")
+	apdexTFlag := flag.Int("apdex-t", 0, "Apdex satisfaction threshold in ms (default: 500)")
 
 	if cp := findConfigFlag(os.Args[1:]); cp != "" && *configPath == "" {
 		*configPath = cp
@@ -77,6 +78,8 @@ func main() {
 			overrides.ErrorRateThreshold = *errorRateThresholdFlag
 		case "throughput-drop-threshold":
 			overrides.ThroughputDropThreshold = *throughputDropFlag
+		case "apdex-t":
+			overrides.ApdexT = *apdexTFlag
 		}
 	})
 
@@ -96,14 +99,21 @@ func main() {
 
 	engine := metrics.NewEngine(store, cfg.MetricsWindow)
 	detector := alerts.NewDetector(engine, cfg.AnomalyThreshold, cfg.BaselineWindows)
-	if cfg.WebhookURL != "" {
-		detector.SetNotifier(alerts.NewWebhookNotifier(cfg.WebhookURL))
+	if targets := cfg.EffectiveWebhooks(); len(targets) > 0 {
+		wts := make([]alerts.WebhookTarget, len(targets))
+		for i, t := range targets {
+			wts[i] = alerts.WebhookTarget{URL: t.URL, Format: t.Format, Events: t.Events}
+		}
+		detector.SetMultiNotifier(alerts.NewMultiNotifier(wts))
 	}
 	if cfg.ErrorRateThreshold > 0 {
 		detector.SetErrorRateThreshold(cfg.ErrorRateThreshold)
 	}
 	if cfg.ThroughputDropThreshold > 0 {
 		detector.SetThroughputDropThreshold(cfg.ThroughputDropThreshold)
+	}
+	if cfg.AnomalySensitivity > 0 && cfg.StatisticalWindows >= 3 {
+		detector.SetStatisticalParams(cfg.AnomalySensitivity, cfg.StatisticalWindows)
 	}
 	detector.Start()
 
@@ -130,7 +140,7 @@ func main() {
 		log.Printf("health check enabled: target=%s interval=%s", cfg.Upstream+path, interval)
 	}
 
-	apiSrv := api.NewServer(engine, cfg.APIAddr, cfg.BaselineWindows, detector, checker)
+	apiSrv := api.NewServer(engine, cfg.APIAddr, cfg.BaselineWindows, cfg.ApdexT, detector, checker)
 	if err := apiSrv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: starting dashboard server: %v\n", err)
 		os.Exit(1)

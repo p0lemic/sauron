@@ -191,3 +191,48 @@ func TestNewCreatesFileOnDisk(t *testing.T) {
 	_, err = os.Stat(dbPath)
 	assert.NoError(t, err, "database file should exist on disk")
 }
+
+// --- US-45: TraceContext storage ---
+
+// TC-11: migrate() añade columnas trace_id y span_id; INSERTs con valores vacíos funcionan.
+func TestMigrateAddsTraceColumns(t *testing.T) {
+	store, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer store.Close()
+
+	err = store.Save(Record{
+		Timestamp:  time.Now(),
+		Method:     "GET",
+		Path:       "/x",
+		StatusCode: 200,
+		DurationMs: 1.0,
+		TraceID:    "",
+		SpanID:     "",
+	})
+	require.NoError(t, err)
+}
+
+// TC-12: Save y FindByWindow preservan trace_id y span_id.
+func TestSaveAndFindPreservesTraceIDs(t *testing.T) {
+	store, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	err = store.Save(Record{
+		Timestamp:  now,
+		Method:     "GET",
+		Path:       "/traced",
+		StatusCode: 200,
+		DurationMs: 42.0,
+		TraceID:    "4bf92f3577b34da6a3ce929d0e0e4736",
+		SpanID:     "a2fb4a1d1a96d312",
+	})
+	require.NoError(t, err)
+
+	records, err := store.FindByWindow(now.Add(-time.Second), now.Add(time.Second))
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", records[0].TraceID)
+	assert.Equal(t, "a2fb4a1d1a96d312", records[0].SpanID)
+}

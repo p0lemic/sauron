@@ -39,7 +39,7 @@ func newTestServer(t *testing.T, records []storage.Record) *api.Server {
 	t.Helper()
 	engine := metrics.NewEngine(&staticReader{records: records}, time.Minute)
 	detector := alerts.NewDetector(engine, 3.0, 5)
-	srv := api.NewServer(engine, "localhost:0", 5, detector, nil)
+	srv := api.NewServer(engine, "localhost:0", 5, 500, detector, nil)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 	return srv
@@ -222,7 +222,7 @@ func TestAPIAlertsActiveWithData(t *testing.T) {
 	}, window)
 	detector := alerts.NewDetector(engine, 3.0, 5)
 	detector.Evaluate()
-	srv := api.NewServer(engine, "localhost:0", 5, detector, nil)
+	srv := api.NewServer(engine, "localhost:0", 5, 500, detector, nil)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
@@ -828,7 +828,7 @@ func TestAPIAlertsHistoryWithData(t *testing.T) {
 	}, window)
 	detector := alerts.NewDetector(engine, 3.0, 5)
 	detector.Evaluate()
-	srv := api.NewServer(engine, "localhost:0", 5, detector, nil)
+	srv := api.NewServer(engine, "localhost:0", 5, 500, detector, nil)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
@@ -1129,7 +1129,7 @@ func TestHealthWithChecker(t *testing.T) {
 	checker := health.New("http://127.0.0.1:0", 10*time.Second, 5*time.Second, 3)
 	engine := metrics.NewEngine(&staticReader{}, time.Minute)
 	detector := alerts.NewDetector(engine, 3.0, 5)
-	srv := api.NewServer(engine, "localhost:0", 5, detector, checker)
+	srv := api.NewServer(engine, "localhost:0", 5, 500, detector, checker)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
@@ -1265,4 +1265,163 @@ func TestPrometheusPathWithSpecialChars(t *testing.T) {
 
 	body, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(body), `path="/api/v1/users/{id}"`)
+}
+
+// --- US-44: Apdex endpoint ---
+
+// TC-07: GET /metrics/apdex devuelve 200 con estructura correcta.
+func TestApdexEndpointStructure(t *testing.T) {
+	records := []storage.Record{
+		{Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 100, Timestamp: time.Now()},
+		{Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 200, Timestamp: time.Now()},
+	}
+	srv := newTestServer(t, records)
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics/apdex")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var result struct {
+		TMs       int               `json:"t_ms"`
+		Endpoints []json.RawMessage `json:"endpoints"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	assert.Equal(t, 500, result.TMs)
+	assert.Len(t, result.Endpoints, 1)
+}
+
+// TC-08: ?t=250 sobrescribe el umbral — conteos reflejan el nuevo T.
+func TestApdexEndpointCustomT(t *testing.T) {
+	records := []storage.Record{
+		// duration=300ms: satisfied with T=500, but frustrated with T=250 (>4*250=1000? no, 300<1000)
+		// Actually with T=250: 300 > 250 and 300 <= 4*250=1000 → tolerating
+		{Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 300, Timestamp: time.Now()},
+	}
+	srv := newTestServer(t, records)
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics/apdex?t=250")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var result struct {
+		TMs       int `json:"t_ms"`
+		Endpoints []struct {
+			Satisfied  int `json:"satisfied"`
+			Tolerating int `json:"tolerating"`
+		} `json:"endpoints"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	assert.Equal(t, 250, result.TMs)
+	require.Len(t, result.Endpoints, 1)
+	assert.Equal(t, 0, result.Endpoints[0].Satisfied)
+	assert.Equal(t, 1, result.Endpoints[0].Tolerating)
+}
+
+// TC-09: ?t=0 devuelve 400.
+func TestApdexEndpointInvalidTZero(t *testing.T) {
+	srv := newTestServer(t, nil)
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics/apdex?t=0")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var errBody struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&errBody))
+	assert.Contains(t, errBody.Error, "invalid t")
+}
+
+// TC-10: ?t=abc devuelve 400.
+func TestApdexEndpointInvalidTString(t *testing.T) {
+	srv := newTestServer(t, nil)
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics/apdex?t=abc")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// --- US-46: Error fingerprints endpoint ---
+
+// TC-08: GET /metrics/errors/fingerprints devuelve 200 con estructura correcta.
+func TestErrorFingerprintsEndpointStructure(t *testing.T) {
+	records := []storage.Record{
+		{Method: "GET", Path: "/x", StatusCode: 500, DurationMs: 100, Timestamp: time.Now()},
+		{Method: "GET", Path: "/x", StatusCode: 200, DurationMs: 10, Timestamp: time.Now()},
+	}
+	srv := newTestServer(t, records)
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics/errors/fingerprints")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var result struct {
+		TotalErrors  int               `json:"total_errors"`
+		Fingerprints []json.RawMessage `json:"fingerprints"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	assert.Equal(t, 1, result.TotalErrors)
+	assert.Len(t, result.Fingerprints, 1)
+}
+
+// TC-09: ?status=5xx filtra solo errores 5xx.
+func TestErrorFingerprintsFilter5xx(t *testing.T) {
+	records := []storage.Record{
+		{Method: "GET", Path: "/x", StatusCode: 500, DurationMs: 1, Timestamp: time.Now()},
+		{Method: "GET", Path: "/x", StatusCode: 404, DurationMs: 1, Timestamp: time.Now()},
+	}
+	srv := newTestServer(t, records)
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics/errors/fingerprints?status=5xx")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	var result struct {
+		Fingerprints []struct {
+			StatusCode int `json:"status_code"`
+		} `json:"fingerprints"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	require.Len(t, result.Fingerprints, 1)
+	assert.Equal(t, 500, result.Fingerprints[0].StatusCode)
+}
+
+// TC-10: ?status=4xx filtra solo errores 4xx.
+func TestErrorFingerprintsFilter4xx(t *testing.T) {
+	records := []storage.Record{
+		{Method: "GET", Path: "/x", StatusCode: 500, DurationMs: 1, Timestamp: time.Now()},
+		{Method: "GET", Path: "/x", StatusCode: 404, DurationMs: 1, Timestamp: time.Now()},
+	}
+	srv := newTestServer(t, records)
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics/errors/fingerprints?status=4xx")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	var result struct {
+		Fingerprints []struct {
+			StatusCode int `json:"status_code"`
+		} `json:"fingerprints"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	require.Len(t, result.Fingerprints, 1)
+	assert.Equal(t, 404, result.Fingerprints[0].StatusCode)
+}
+
+// TC-11: ?status=3xx devuelve 400 con mensaje de error.
+func TestErrorFingerprintsInvalidStatusFilter(t *testing.T) {
+	srv := newTestServer(t, nil)
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics/errors/fingerprints?status=3xx")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var errBody struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&errBody))
+	assert.Contains(t, errBody.Error, "invalid status filter")
 }

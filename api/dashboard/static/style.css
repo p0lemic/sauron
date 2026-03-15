@@ -868,3 +868,172 @@ section {
   color: var(--text-dim);
   margin-left: 3px;
 }
+
+/* ─── Apdex (US-44) ──────────────────────────────────────────────────── */
+.apdex-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.apdex-val-lg {
+  font-size: 24px;
+  padding: 0;
+  border-radius: 0;
+  background: none !important;
+  border: none !important;
+}
+
+.apdex-great { background: #0d2b1f; color: var(--ok);      border: 1px solid #1a5c3a; }
+.apdex-good  { background: #2b2010; color: var(--warning);  border: 1px solid #6b4c10; }
+.apdex-poor  { background: var(--danger-bg); color: var(--danger); border: 1px solid #7a2020; }
+
+/* ─── Error Fingerprints (US-46) ─────────────────────────────────────── */
+.fp-new-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 20px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: var(--accent-dim);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  animation: badge-appear 0.3s ease;
+}
+
+/* ─── Trace badge (US-45) ────────────────────────────────────────────── */
+.trace-badge {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1px 5px;
+  letter-spacing: 0.04em;
+  cursor: default;
+  user-select: all;
+}
+
+.cell-dim {
+  color: var(--text-muted);
+}
+
+/* ─── section dot warning ────────────────────────────────────────────── */
+.dot-warn   { background: var(--warning) !important; }
+.dot-danger { background: var(--danger)  !important; }
+
+/* ─── Traffic Heatmap (US-47) ────────────────────────────────────────── */
+.hm-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.hm-row {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
+
+.hm-day-label {
+  width: 36px;
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-align: right;
+  padding-right: 6px;
+  letter-spacing: 0.03em;
+}
+
+.hm-hour-label {
+  width: 28px;
+  flex-shrink: 0;
+  font-size: 9px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.hm-cell {
+  width: 28px;
+  height: 20px;
+  flex-shrink: 0;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: opacity 0.15s;
+  cursor: default;
+}
+
+.hm-cell:hover {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.hm-legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding-left: 42px;
+}
+
+.hm-legend-label {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.hm-legend-bar {
+  width: 100px;
+  height: 8px;
+  border-radius: 2px;
+  border: 1px solid var(--border);
+}
+
+/* ─── Alert History timeline (US-50) ─────────────────────────────────── */
+.ah-timeline-cell {
+  width: 220px;
+  padding: 6px 8px;
+}
+
+.ah-timeline-wrap {
+  position: relative;
+  height: 12px;
+  background: var(--surface-2);
+  border-radius: 2px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.ah-timeline-bar {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 2px;
+  min-width: 3px;
+}
+
+.ah-active   { background: var(--danger); }
+.ah-resolved { background: var(--ok); opacity: 0.7; }
+
+.ah-ongoing {
+  color: var(--danger);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* ─── Statistical anomaly kind badge (US-48) ─────────────────────────── */
+.kind-statistical {
+  background: #1a1a2e;
+  color: #a78bfa;
+  border: 1px solid #4c1d95;
+}

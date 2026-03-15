@@ -15,6 +15,7 @@ type AlertRecord struct {
 	CurrentRPS         float64    `json:"current_rps"`
 	BaselineRPS        float64    `json:"baseline_rps"`
 	DropPct            float64    `json:"drop_pct"`
+	ZScore             float64    `json:"z_score"`
 	TriggeredAt        time.Time  `json:"triggered_at"`
 	ResolvedAt         *time.Time `json:"resolved_at"`
 }

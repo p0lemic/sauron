@@ -105,6 +105,95 @@ function stopPolling() {
   if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
 }
 
+// ── Heatmap (US-47) ───────────────────────────────────────────────────────────
+let _heatmapMetric = 'rps';
+
+function initHeatmapTabs() {
+  const tabs = el('heatmap-tabs');
+  if (!tabs) return;
+  tabs.addEventListener('click', e => {
+    const btn = e.target.closest('.panel-tab');
+    if (!btn) return;
+    tabs.querySelectorAll('.panel-tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    _heatmapMetric = btn.dataset.metric;
+    fetchHeatmap();
+  });
+}
+
+async function fetchHeatmap() {
+  try {
+    const rp  = rangeParams();
+    const res = await fetch(`/metrics/heatmap${rp}${rp ? '&' : '?'}metric=${_heatmapMetric}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const body = el('heatmap')?.querySelector('.section-body');
+    if (!body) return;
+
+    const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const unit = _heatmapMetric === 'error_rate' ? '%' : 'rps';
+    const color = _heatmapMetric === 'error_rate' ? 'var(--danger)' : 'var(--accent)';
+    const maxVal = data.max || 1;
+
+    // Build cell lookup: weekday*24+hour → value
+    const vals = new Array(168).fill(0);
+    for (const c of data.cells) { vals[c.weekday * 24 + c.hour] = c.value; }
+
+    // Header row: empty corner + hour labels
+    const hourRow = '<div class="hm-row">' +
+      '<div class="hm-day-label"></div>' +
+      Array.from({length:24}, (_,h) =>
+        `<div class="hm-hour-label">${String(h).padStart(2,'0')}</div>`
+      ).join('') +
+      '</div>';
+
+    // Rows per day
+    const rows = DAYS.map((day, wd) => {
+      const cells = Array.from({length:24}, (_,h) => {
+        const v = vals[wd*24+h];
+        const intensity = maxVal > 0 ? v / maxVal : 0;
+        const alpha = (0.08 + intensity * 0.92).toFixed(3);
+        const tip = `${day} ${String(h).padStart(2,'0')}:00 — ${v.toFixed(2)} ${unit}`;
+        return `<div class="hm-cell" style="background:${color};opacity:${alpha}" title="${tip}"></div>`;
+      }).join('');
+      return `<div class="hm-row"><div class="hm-day-label">${day}</div>${cells}</div>`;
+    }).join('');
+
+    body.innerHTML = `<div class="hm-grid">${hourRow}${rows}</div>
+      <div class="hm-legend">
+        <span class="hm-legend-label">0 ${unit}</span>
+        <div class="hm-legend-bar" style="background:linear-gradient(90deg,transparent,${color})"></div>
+        <span class="hm-legend-label">${data.max.toFixed(2)} ${unit}</span>
+      </div>`;
+  } catch (_) {}
+}
+
+// ── Anomaly scores state (US-48) ──────────────────────────────────────────────
+let _anomalyMap = {}; // key: "METHOD|path" → z_score
+
+async function fetchAnomalyScores() {
+  try {
+    const res = await fetch('/metrics/anomaly-scores');
+    if (!res.ok) return;
+    const scores = await res.json();
+    _anomalyMap = {};
+    for (const s of (scores || [])) {
+      if (s.has_baseline) _anomalyMap[s.method + '|' + s.path] = s.z_score;
+    }
+    renderTable();
+  } catch (_) {}
+}
+
+// ── Apdex state ───────────────────────────────────────────────────────────────
+let _apdexMap    = {}; // key: "METHOD|path" → apdex score (0-1)
+let _globalApdex = null; // last computed global apdex (0-1)
+
+function fmtGlobalApdex() {
+  if (_globalApdex === null) return '<span class="cell-dim">—</span>';
+  const cls = _globalApdex >= 0.85 ? 'apdex-great' : _globalApdex >= 0.70 ? 'apdex-good' : 'apdex-poor';
+  return `<span class="apdex-badge apdex-val-lg ${cls}">${_globalApdex.toFixed(2)}</span>`;
+}
+
 // ── Summary (US-19) ───────────────────────────────────────────────────────────
 async function fetchSummary() {
   try {
@@ -134,6 +223,10 @@ async function fetchSummary() {
           <div class="stat-label">Active Endpoints</div>
           <div class="stat-value">${d.active_endpoints}</div>
         </div>
+        <div class="stat-card apdex-stat-card">
+          <div class="stat-label">Global Apdex</div>
+          <div class="stat-value" id="global-apdex-value">${fmtGlobalApdex()}</div>
+        </div>
       </div>`;
   } catch (_) { /* keep last known value */ }
 }
@@ -158,6 +251,20 @@ const COLS = [
   { key: 'error_rate',  label: 'Err%',  fmt: v => {
       const cls = v >= 5 ? 'danger' : v >= 1 ? 'warning' : '';
       return `<span class="${cls}">${fmt(v,1)}%</span>`;
+    }
+  },
+  { key: 'apdex', label: 'Apdex', fmt: (_, r) => {
+      const a = _apdexMap[r.method + '|' + r.path];
+      if (a === undefined) return '<span class="cell-dim">—</span>';
+      const cls = a >= 0.85 ? 'apdex-great' : a >= 0.70 ? 'apdex-good' : 'apdex-poor';
+      return `<span class="apdex-badge ${cls}">${a.toFixed(2)}</span>`;
+    }
+  },
+  { key: 'z_score', label: 'Z', fmt: (_, r) => {
+      const z = _anomalyMap[r.method + '|' + r.path];
+      if (z === undefined) return '<span class="cell-dim">—</span>';
+      const cls = z >= 2.0 ? 'danger' : z >= 1.5 ? 'warning' : '';
+      return `<span class="${cls}">${z.toFixed(1)}σ</span>`;
     }
   },
   { key: 'count',       label: 'Count', fmt: v => fmt(v) },
@@ -248,6 +355,83 @@ async function fetchEndpoints() {
     _tableData = await res.json();
     renderTable();
   } catch (_) { /* keep last known table */ }
+}
+
+// ── Apdex (US-44) ────────────────────────────────────────────────────────────
+async function fetchApdex() {
+  try {
+    const res = await fetch('/metrics/apdex' + rangeParams());
+    if (!res.ok) return;
+    const data = await res.json();
+    const stats = data.endpoints || [];
+
+    // Build per-endpoint lookup map and accumulate global totals.
+    _apdexMap = {};
+    let sumSat = 0, sumTol = 0, sumTotal = 0;
+    for (const s of stats) {
+      _apdexMap[s.method + '|' + s.path] = s.apdex;
+      sumSat   += s.satisfied;
+      sumTol   += s.tolerating;
+      sumTotal += s.total;
+    }
+
+    // Re-render endpoints table so the Apdex column populates.
+    renderTable();
+
+    // Update cached global Apdex and refresh its element.
+    if (sumTotal > 0) {
+      _globalApdex = (sumSat + sumTol / 2) / sumTotal;
+      const apdexEl = el('global-apdex-value');
+      if (apdexEl) apdexEl.innerHTML = fmtGlobalApdex();
+    }
+  } catch (_) { /* keep last known value */ }
+}
+
+// ── Error Fingerprints (US-46) ────────────────────────────────────────────────
+async function fetchErrorFingerprints() {
+  try {
+    const res = await fetch('/metrics/errors/fingerprints' + rangeParams());
+    if (!res.ok) return;
+    const data = await res.json();
+    const fps = data.fingerprints || [];
+    const body = el('error-fingerprints')?.querySelector('.section-body');
+    if (!body) return;
+
+    if (!fps || fps.length === 0) {
+      body.innerHTML = '<div class="placeholder">No error fingerprints</div>';
+      return;
+    }
+
+    const rows = fps.map(f => {
+      const sc      = statusClass(f.status_code);
+      const mcls    = METHOD_COLORS[f.method] || 'badge-other';
+      const newBadge = f.is_new ? '<span class="fp-new-badge">new</span>' : '';
+      const last    = new Date(f.last_seen).toLocaleTimeString();
+      return `<tr>
+        <td><span class="method-badge ${mcls}">${escHtml(f.method)}</span></td>
+        <td><span class="cell-path">${escHtml(f.path)}</span></td>
+        <td class="cell-status ${sc}">${f.status_code}</td>
+        <td>${fmt(f.count)}</td>
+        <td>${fmt(f.rate, 2)}<span class="cell-unit">%</span></td>
+        <td>${fmt(f.p50_ms, 1)}<span class="cell-unit">ms</span></td>
+        <td>${fmt(f.p95_ms, 1)}<span class="cell-unit">ms</span></td>
+        <td class="cell-time">${last}</td>
+        <td>${newBadge}</td>
+      </tr>`;
+    }).join('');
+
+    body.innerHTML = `
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr>
+            <th>Method</th><th>Path</th><th>Status</th>
+            <th>Count</th><th>Rate</th><th>P50</th><th>P95</th>
+            <th>Last Seen</th><th></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  } catch (_) { /* keep last known state */ }
 }
 
 // ── Latency chart (US-21) ─────────────────────────────────────────────────────
@@ -523,10 +707,24 @@ async function fetchStatusBreakdown() {
   } catch (_) { /* keep last known state */ }
 }
 
+// ── Requests section tab switching ───────────────────────────────────────────
+function initRequestsTabs() {
+  const tabs = el('requests-tabs');
+  if (!tabs) return;
+  tabs.addEventListener('click', e => {
+    const btn = e.target.closest('.panel-tab');
+    if (!btn) return;
+    tabs.querySelectorAll('.panel-tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    el('requests-tab-log').style.display     = btn.dataset.tab === 'log'     ? '' : 'none';
+    el('requests-tab-slowest').style.display = btn.dataset.tab === 'slowest' ? '' : 'none';
+  });
+}
+
 // ── Slowest Requests (US-29) ──────────────────────────────────────────────────
 function buildRequestRows(records) {
   if (records.length === 0) {
-    return `<tr><td colspan="5" class="no-data">No data</td></tr>`;
+    return `<tr><td colspan="6" class="no-data">No data</td></tr>`;
   }
   return records.map(r => {
     const t   = new Date(r.timestamp);
@@ -535,12 +733,16 @@ function buildRequestRows(records) {
     const cls = METHOD_COLORS[r.method] || 'badge-other';
     const sc  = statusClass(r.status_code);
     const durCls = r.duration_ms >= 1000 ? 'danger' : '';
+    const traceCell = r.trace_id
+      ? `<span class="trace-badge" title="${escHtml(r.trace_id)}">${escHtml(r.trace_id.slice(0, 8))}</span>`
+      : '<span class="cell-dim">—</span>';
     return `<tr>
       <td class="cell-time">${hms}.${ms}</td>
       <td><span class="method-badge ${cls}">${escHtml(r.method)}</span></td>
       <td><span class="cell-path">${escHtml(r.path)}</span></td>
       <td class="cell-status ${sc}">${r.status_code}</td>
       <td class="cell-dur ${durCls}">${Number(r.duration_ms).toFixed(1)}<span class="cell-unit">ms</span></td>
+      <td>${traceCell}</td>
     </tr>`;
   }).join('');
 }
@@ -552,16 +754,18 @@ async function fetchSlowestRequests() {
     const res = await fetch('/metrics/slowest-requests' + rp + sep + 'n=10');
     if (!res.ok) return;
     const records = await res.json();
-    const body = el('slowest-requests').querySelector('.section-body');
-    if (!body) return;
-    body.innerHTML = `
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead><tr>
-            <th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th>
-          </tr></thead>
-          <tbody>${buildRequestRows(records)}</tbody>
-        </table>
+    const pane = el('requests-tab-slowest');
+    if (!pane) return;
+    pane.innerHTML = `
+      <div class="section-body">
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>
+              <th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>Trace</th>
+            </tr></thead>
+            <tbody>${buildRequestRows(records)}</tbody>
+          </table>
+        </div>
       </div>`;
   } catch (_) { /* keep last known state */ }
 }
@@ -590,7 +794,7 @@ function statusClass(code) {
 }
 
 function renderRequestLog() {
-  const body = el('request-log').querySelector('.section-body');
+  const body = el('requests-tab-log');
   if (!body) return;
 
   const filtered = _rlData.filter(r => {
@@ -614,6 +818,7 @@ function renderRequestLog() {
   const paginationInfo = `${rangeStart}–${rangeEnd} of ${filtered.length}`;
 
   body.innerHTML = `
+    <div class="section-body">
     <div class="table-toolbar rl-toolbar">
       <input id="rl-filter" class="filter-input" type="text"
              placeholder="Filter path…" value="${escHtml(_rlPath)}" autocomplete="off">
@@ -636,7 +841,7 @@ function renderRequestLog() {
     <div class="table-wrap">
       <table class="data-table">
         <thead><tr>
-          <th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th>
+          <th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>Trace</th>
         </tr></thead>
         <tbody>${trRows}</tbody>
       </table>
@@ -645,6 +850,7 @@ function renderRequestLog() {
       <button class="page-btn" id="rl-prev" ${_rlPage === 0 ? 'disabled' : ''}>← Prev</button>
       <span class="page-info">${paginationInfo}</span>
       <button class="page-btn" id="rl-next" ${_rlPage >= totalPages - 1 ? 'disabled' : ''}>Next →</button>
+    </div>
     </div>`;
 
   el('rl-filter').addEventListener('input', e => { _rlPath = e.target.value; _rlPage = 0; renderRequestLog(); });
@@ -684,12 +890,128 @@ async function fetchHealth() {
 }
 
 // ── Refresh loop ──────────────────────────────────────────────────────────────
+// ── Alert History (US-50) ─────────────────────────────────────────────────────
+let _ahKindFilter = 'all';
+
+async function fetchAlertHistory() {
+  try {
+    const res = await fetch('/alerts/history');
+    if (!res.ok) return;
+    const records = await res.json();
+    const section = el('alert-history');
+    if (!section) return;
+    if (!records || records.length === 0) {
+      section.style.display = 'none';
+      return;
+    }
+    renderAlertHistory(records);
+    section.style.display = '';
+  } catch (_) {}
+}
+
+function renderAlertHistory(records) {
+  const section = el('alert-history');
+  const body    = section.querySelector('.section-body');
+  const tabsEl  = el('ah-kind-tabs');
+
+  // Collect kinds present.
+  const kindsPresent = [...new Set(records.map(r => r.kind))];
+  const kindLabels   = { latency: 'Latency', error_rate: 'Error Rate', throughput: 'Throughput', statistical: 'Statistical' };
+
+  // Build kind filter tabs.
+  const allKinds = ['all', ...kindsPresent];
+  tabsEl.innerHTML = allKinds.map(k =>
+    `<button class="panel-tab${_ahKindFilter === k ? ' active' : ''}" data-kind="${k}">${k === 'all' ? 'All' : (kindLabels[k] || k)}</button>`
+  ).join('');
+  tabsEl.onclick = e => {
+    const btn = e.target.closest('.panel-tab');
+    if (!btn) return;
+    _ahKindFilter = btn.dataset.kind;
+    renderAlertHistory(records);
+  };
+
+  const filtered = _ahKindFilter === 'all' ? records : records.filter(r => r.kind === _ahKindFilter);
+
+  // Compute timeline range.
+  const tMin = Math.min(...filtered.map(r => new Date(r.triggered_at).getTime()));
+  const tMax = Math.max(...filtered.map(r => r.resolved_at ? new Date(r.resolved_at).getTime() : Date.now()));
+  const span = tMax - tMin || 1;
+
+  const rows = filtered.map(r => {
+    const kindCls = r.kind === 'error_rate' ? 'kind-error-rate'
+                  : r.kind === 'throughput' ? 'kind-throughput'
+                  : r.kind === 'statistical' ? 'kind-statistical'
+                  : 'kind-latency';
+    const kindLabel = kindLabels[r.kind] || r.kind;
+    const triggered = new Date(r.triggered_at).toLocaleTimeString();
+    const resolvedAt = r.resolved_at ? new Date(r.resolved_at) : null;
+    const resolvedCell = resolvedAt
+      ? resolvedAt.toLocaleTimeString()
+      : '<span class="ah-ongoing">active</span>';
+
+    const durMs = resolvedAt
+      ? resolvedAt.getTime() - new Date(r.triggered_at).getTime()
+      : Date.now() - new Date(r.triggered_at).getTime();
+    const durStr = resolvedAt ? fmtDuration(durMs) : '<span class="ah-ongoing">ongoing</span>';
+
+    // Timeline bar
+    const tStart  = new Date(r.triggered_at).getTime();
+    const tEnd    = resolvedAt ? resolvedAt.getTime() : Date.now();
+    const left    = ((tStart - tMin) / span * 100).toFixed(1);
+    const width   = Math.max(((tEnd - tStart) / span * 100), 1).toFixed(1);
+    const barCls  = resolvedAt ? 'ah-resolved' : 'ah-active';
+
+    return `<tr>
+      <td><span class="kind-badge ${kindCls}">${kindLabel}</span></td>
+      <td><span class="method-badge ${METHOD_COLORS[r.method]||'badge-other'}">${escHtml(r.method)}</span></td>
+      <td><span class="cell-path">${escHtml(r.path)}</span></td>
+      <td class="cell-time">${triggered}</td>
+      <td class="cell-time">${resolvedCell}</td>
+      <td>${durStr}</td>
+      <td class="ah-timeline-cell">
+        <div class="ah-timeline-wrap">
+          <div class="ah-timeline-bar ${barCls}" style="left:${left}%;width:${width}%"></div>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+
+  body.innerHTML = `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr>
+          <th>Kind</th><th>Method</th><th>Path</th>
+          <th>Triggered</th><th>Resolved</th><th>Duration</th><th>Timeline</th>
+        </tr></thead>
+        <tbody>${rows || `<tr><td colspan="7" class="no-data">No data</td></tr>`}</tbody>
+      </table>
+    </div>`;
+}
+
+function fmtDuration(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), rs = s % 60;
+  if (m < 60) return `${m}m ${rs}s`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return `${h}h ${rm}m`;
+}
+
 async function refresh() {
-  await Promise.all([fetchSummary(), fetchStatusBreakdown(), fetchEndpoints(), fetchAlerts(), fetchSlowestRequests(), fetchRequests(), fetchHealth()]);
+  await Promise.all([
+    fetchHeatmap(),
+    fetchSummary(), fetchStatusBreakdown(), fetchEndpoints(),
+    fetchApdex(), fetchAnomalyScores(), fetchErrorFingerprints(),
+    fetchAlerts(), fetchAlertHistory(),
+    fetchSlowestRequests(), fetchRequests(), fetchHealth(),
+  ]);
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 initTimeRange();
+initHeatmapTabs();
+initRequestsTabs();
 refresh();
 startPolling();
 

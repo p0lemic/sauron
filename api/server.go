@@ -24,6 +24,7 @@ var dashboardFS embed.FS
 type Server struct {
 	engine          *metrics.Engine
 	baselineWindows int
+	apdexT          int
 	detector        *alerts.Detector
 	checker         *health.Checker // nil if health check disabled
 	srv             *http.Server
@@ -33,10 +34,14 @@ type Server struct {
 // NewServer creates a Server backed by engine.
 // addr is the listen address (e.g. "localhost:9090").
 // baselineWindows is the number of past windows used for baseline computation.
+// apdexT is the default Apdex satisfaction threshold in ms (0 → use 500).
 // detector provides active alert data for GET /alerts/active.
 // checker is optional (nil = disabled); when non-nil, GET /health includes upstream state.
-func NewServer(engine *metrics.Engine, addr string, baselineWindows int, detector *alerts.Detector, checker *health.Checker) *Server {
-	s := &Server{engine: engine, baselineWindows: baselineWindows, detector: detector, checker: checker}
+func NewServer(engine *metrics.Engine, addr string, baselineWindows int, apdexT int, detector *alerts.Detector, checker *health.Checker) *Server {
+	if apdexT <= 0 {
+		apdexT = 500
+	}
+	s := &Server{engine: engine, baselineWindows: baselineWindows, apdexT: apdexT, detector: detector, checker: checker}
 	mux := http.NewServeMux()
 	sub, _ := fs.Sub(dashboardFS, "dashboard")
 	mux.Handle("/static/", http.FileServer(http.FS(sub)))
@@ -59,6 +64,10 @@ func NewServer(engine *metrics.Engine, addr string, baselineWindows int, detecto
 	mux.HandleFunc("/metrics/status", s.handleStatus)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/metrics/prometheus", s.handlePrometheus)
+	mux.HandleFunc("/metrics/apdex", s.handleApdex)
+	mux.HandleFunc("/metrics/errors/fingerprints", s.handleErrorFingerprints)
+	mux.HandleFunc("/metrics/heatmap", s.handleHeatmap)
+	mux.HandleFunc("/metrics/anomaly-scores", s.handleAnomalyScores)
 	s.srv = &http.Server{Addr: addr, Handler: mux}
 	return s
 }
@@ -629,4 +638,173 @@ func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
 	for _, kind := range []string{alerts.KindLatency, alerts.KindErrorRate, alerts.KindThroughput} {
 		fmt.Fprintf(w, "apiprofiler_active_alerts_total{kind=%q} %d\n", kind, counts[kind])
 	}
+}
+
+func (s *Server) handleApdex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	tMs := float64(s.apdexT)
+	if raw := r.URL.Query().Get("t"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "invalid t: must be a positive integer (ms)")
+			return
+		}
+		tMs = float64(n)
+	}
+
+	var (
+		stats []metrics.ApdexStat
+		err   error
+	)
+	if raw := r.URL.Query().Get("window"); raw != "" {
+		win, parseErr := parseWindow(raw)
+		if parseErr != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid window %q: %v", raw, parseErr))
+			return
+		}
+		now := time.Now()
+		stats, err = s.engine.ApdexForRange(tMs, now.Add(-win), now)
+	} else {
+		stats, err = s.engine.Apdex(tMs)
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if stats == nil {
+		stats = []metrics.ApdexStat{}
+	}
+
+	resp := struct {
+		TMs       int                 `json:"t_ms"`
+		Endpoints []metrics.ApdexStat `json:"endpoints"`
+	}{
+		TMs:       int(tMs),
+		Endpoints: stats,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp) //nolint:errcheck
+}
+
+func (s *Server) handleErrorFingerprints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	statusFilter := r.URL.Query().Get("status")
+	if statusFilter != "" && statusFilter != "4xx" && statusFilter != "5xx" {
+		writeJSONError(w, http.StatusBadRequest, "invalid status filter: use 4xx or 5xx")
+		return
+	}
+
+	var (
+		fps []metrics.ErrorFingerprint
+		err error
+	)
+	if raw := r.URL.Query().Get("window"); raw != "" {
+		win, parseErr := parseWindow(raw)
+		if parseErr != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid window %q: %v", raw, parseErr))
+			return
+		}
+		now := time.Now()
+		fps, err = s.engine.ErrorFingerprintsForRange(now.Add(-win), now)
+	} else {
+		fps, err = s.engine.ErrorFingerprints()
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Apply optional status class filter.
+	if statusFilter != "" {
+		filtered := fps[:0]
+		for _, fp := range fps {
+			if statusFilter == "4xx" && fp.StatusCode >= 400 && fp.StatusCode < 500 {
+				filtered = append(filtered, fp)
+			} else if statusFilter == "5xx" && fp.StatusCode >= 500 {
+				filtered = append(filtered, fp)
+			}
+		}
+		fps = filtered
+	}
+	if fps == nil {
+		fps = []metrics.ErrorFingerprint{}
+	}
+
+	totalErrors := 0
+	for _, fp := range fps {
+		totalErrors += fp.Count
+	}
+
+	resp := struct {
+		TotalErrors  int                        `json:"total_errors"`
+		Fingerprints []metrics.ErrorFingerprint `json:"fingerprints"`
+	}{
+		TotalErrors:  totalErrors,
+		Fingerprints: fps,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp) //nolint:errcheck
+}
+
+func (s *Server) handleHeatmap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	metric := r.URL.Query().Get("metric")
+	if metric == "" {
+		metric = "rps"
+	}
+	if metric != "rps" && metric != "error_rate" {
+		writeJSONError(w, http.StatusBadRequest, "metric must be rps or error_rate")
+		return
+	}
+	from, to, err := parseTimeRange(r)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if from.IsZero() {
+		now := time.Now()
+		from = now.Add(-s.engine.Window())
+		to = now
+	}
+	result, err := s.engine.Heatmap(metric, from, to)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result) //nolint:errcheck
+}
+
+func (s *Server) handleAnomalyScores(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n := s.baselineWindows
+	if raw := r.URL.Query().Get("windows"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 3 {
+			writeJSONError(w, http.StatusBadRequest, "windows must be an integer >= 3")
+			return
+		}
+		n = parsed
+	}
+	scores, err := s.engine.AnomalyScores(n)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(scores) //nolint:errcheck
 }

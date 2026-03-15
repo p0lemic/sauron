@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -633,6 +634,371 @@ func (e *Engine) Slowest(n int) ([]EndpointStat, error) {
 		all = all[:n]
 	}
 	return all, nil
+}
+
+// Window returns the engine's configured lookback duration.
+func (e *Engine) Window() time.Duration { return e.window }
+
+// ApdexStat holds Apdex score and component counts for one endpoint.
+// Apdex = -1 when there are no records for the endpoint.
+type ApdexStat struct {
+	Method     string  `json:"method"`
+	Path       string  `json:"path"`
+	Apdex      float64 `json:"apdex"`
+	Satisfied  int     `json:"satisfied"`
+	Tolerating int     `json:"tolerating"`
+	Frustrated int     `json:"frustrated"`
+	Total      int     `json:"total"`
+}
+
+// Apdex computes Apdex scores for all endpoints using threshold tMs (ms).
+// Uses the engine's default window. Sorted by Apdex ascending (most problematic first).
+func (e *Engine) Apdex(tMs float64) ([]ApdexStat, error) {
+	now := time.Now()
+	return e.ApdexForRange(tMs, now.Add(-e.window), now)
+}
+
+// ApdexForRange computes Apdex scores for an explicit [from, to] range.
+func (e *Engine) ApdexForRange(tMs float64, from, to time.Time) ([]ApdexStat, error) {
+	records, err := e.reader.FindByWindow(from, to)
+	if err != nil {
+		return nil, err
+	}
+	return apdexFromRecords(records, tMs), nil
+}
+
+func apdexFromRecords(records []storage.Record, tMs float64) []ApdexStat {
+	type counts struct{ satisfied, tolerating, frustrated int }
+	type key struct{ method, path string }
+	groups := make(map[key]*counts)
+	for _, r := range records {
+		k := key{r.Method, r.Path}
+		if groups[k] == nil {
+			groups[k] = &counts{}
+		}
+		switch {
+		case r.DurationMs <= tMs:
+			groups[k].satisfied++
+		case r.DurationMs <= 4*tMs:
+			groups[k].tolerating++
+		default:
+			groups[k].frustrated++
+		}
+	}
+	stats := make([]ApdexStat, 0, len(groups))
+	for k, c := range groups {
+		total := c.satisfied + c.tolerating + c.frustrated
+		var score float64
+		if total == 0 {
+			score = -1
+		} else {
+			score = math.Round((float64(c.satisfied)+float64(c.tolerating)/2)/float64(total)*1000) / 1000
+		}
+		stats = append(stats, ApdexStat{
+			Method:     k.method,
+			Path:       k.path,
+			Apdex:      score,
+			Satisfied:  c.satisfied,
+			Tolerating: c.tolerating,
+			Frustrated: c.frustrated,
+			Total:      total,
+		})
+	}
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Apdex < stats[j].Apdex })
+	return stats
+}
+
+// ErrorFingerprint holds aggregated error stats for one (method, path, status_code) tuple.
+type ErrorFingerprint struct {
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	StatusCode int       `json:"status_code"`
+	Count      int       `json:"count"`
+	Rate       float64   `json:"rate"`      // % of total requests for this endpoint
+	FirstSeen  time.Time `json:"first_seen"`
+	LastSeen   time.Time `json:"last_seen"`
+	P50Ms      float64   `json:"p50_ms"`
+	P95Ms      float64   `json:"p95_ms"`
+	IsNew      bool      `json:"is_new"`
+}
+
+// ErrorFingerprints returns error fingerprints for the engine's current window.
+// Sorted by count descending.
+func (e *Engine) ErrorFingerprints() ([]ErrorFingerprint, error) {
+	now := time.Now()
+	return e.ErrorFingerprintsForRange(now.Add(-e.window), now)
+}
+
+// ErrorFingerprintsForRange returns error fingerprints for an explicit [from, to] range.
+func (e *Engine) ErrorFingerprintsForRange(from, to time.Time) ([]ErrorFingerprint, error) {
+	records, err := e.reader.FindByWindow(from, to)
+	if err != nil {
+		return nil, err
+	}
+	return errorFingerprintsFromRecords(records, from, to), nil
+}
+
+func errorFingerprintsFromRecords(records []storage.Record, from, to time.Time) []ErrorFingerprint {
+	type endpointKey struct{ method, path string }
+	type fpKey struct {
+		method, path string
+		statusCode   int
+	}
+	type fpData struct {
+		durations  []float64
+		timestamps []time.Time
+	}
+
+	// Count totals per endpoint (for rate calculation).
+	endpointTotals := make(map[endpointKey]int)
+	for _, r := range records {
+		endpointTotals[endpointKey{r.Method, r.Path}]++
+	}
+
+	// Group 4xx/5xx records by fingerprint.
+	fpGroups := make(map[fpKey]*fpData)
+	for _, r := range records {
+		if r.StatusCode < 400 {
+			continue
+		}
+		k := fpKey{r.Method, r.Path, r.StatusCode}
+		if fpGroups[k] == nil {
+			fpGroups[k] = &fpData{}
+		}
+		fpGroups[k].durations = append(fpGroups[k].durations, r.DurationMs)
+		fpGroups[k].timestamps = append(fpGroups[k].timestamps, r.Timestamp)
+	}
+
+	// Threshold for is_new: first_seen in the last 10% of the window.
+	windowLen := to.Sub(from)
+	newThreshold := from.Add(time.Duration(float64(windowLen) * 0.9))
+
+	result := make([]ErrorFingerprint, 0, len(fpGroups))
+	for k, data := range fpGroups {
+		total := endpointTotals[endpointKey{k.method, k.path}]
+		var rate float64
+		if total > 0 {
+			rate = math.Round(float64(len(data.durations))/float64(total)*100*10) / 10
+		}
+
+		sort.Float64s(data.durations)
+
+		firstSeen := data.timestamps[0]
+		lastSeen := data.timestamps[0]
+		for _, ts := range data.timestamps[1:] {
+			if ts.Before(firstSeen) {
+				firstSeen = ts
+			}
+			if ts.After(lastSeen) {
+				lastSeen = ts
+			}
+		}
+
+		result = append(result, ErrorFingerprint{
+			Method:     k.method,
+			Path:       k.path,
+			StatusCode: k.statusCode,
+			Count:      len(data.durations),
+			Rate:       rate,
+			FirstSeen:  firstSeen,
+			LastSeen:   lastSeen,
+			P50Ms:      pct(data.durations, 50),
+			P95Ms:      pct(data.durations, 95),
+			IsNew:      firstSeen.After(newThreshold),
+		})
+	}
+
+	sort.Slice(result, func(i, j int) bool { return result[i].Count > result[j].Count })
+	return result
+}
+
+// ── US-47: Traffic Heatmap ────────────────────────────────────────────────────
+
+// HeatmapPoint is one cell in the 7×24 traffic grid.
+type HeatmapPoint struct {
+	Weekday int     `json:"weekday"` // 0=Sunday .. 6=Saturday
+	Hour    int     `json:"hour"`    // 0..23
+	Value   float64 `json:"value"`
+}
+
+// HeatmapResult is the response payload for GET /metrics/heatmap.
+type HeatmapResult struct {
+	Metric string         `json:"metric"`
+	Cells  []HeatmapPoint `json:"cells"` // always 168 entries (7×24)
+	Max    float64        `json:"max"`
+}
+
+// Heatmap aggregates request data for the given [from, to) range into a 7×24
+// weekday/hour grid. metric must be "rps" or "error_rate".
+func (e *Engine) Heatmap(metric string, from, to time.Time) (*HeatmapResult, error) {
+	if metric != "rps" && metric != "error_rate" {
+		return nil, fmt.Errorf("unsupported metric %q: must be rps or error_rate", metric)
+	}
+	records, err := e.reader.FindByWindow(from, to)
+	if err != nil {
+		return nil, err
+	}
+
+	type cellData struct{ count, errors int }
+	var cells [7][24]cellData
+
+	for _, r := range records {
+		wd := int(r.Timestamp.Weekday())
+		h := r.Timestamp.Hour()
+		cells[wd][h].count++
+		if r.StatusCode >= 400 {
+			cells[wd][h].errors++
+		}
+	}
+
+	// Each (weekday, hour) slot covers 1 hour per week cycle.
+	// If the window spans multiple weeks, the slot recurs; we normalize by that count.
+	windowSecs := to.Sub(from).Seconds()
+	windowWeeks := windowSecs / (7 * 24 * 3600)
+	if windowWeeks < 1 {
+		windowWeeks = 1
+	}
+	slotSecs := windowWeeks * 3600
+
+	result := &HeatmapResult{Metric: metric, Cells: make([]HeatmapPoint, 0, 168)}
+	var maxVal float64
+	for wd := 0; wd < 7; wd++ {
+		for h := 0; h < 24; h++ {
+			d := cells[wd][h]
+			var val float64
+			if d.count > 0 {
+				switch metric {
+				case "error_rate":
+					val = math.Round(float64(d.errors)/float64(d.count)*100*100) / 100
+				default:
+					val = float64(d.count) / slotSecs
+				}
+			}
+			if val > maxVal {
+				maxVal = val
+			}
+			result.Cells = append(result.Cells, HeatmapPoint{Weekday: wd, Hour: h, Value: val})
+		}
+	}
+	result.Max = maxVal
+	return result, nil
+}
+
+// ── US-48: Statistical Anomaly Detection ─────────────────────────────────────
+
+// AnomalyScore holds statistical anomaly data for one endpoint.
+type AnomalyScore struct {
+	Method      string  `json:"method"`
+	Path        string  `json:"path"`
+	CurrentP99  float64 `json:"current_p99"`
+	MeanP99     float64 `json:"mean_p99"`
+	StddevP99   float64 `json:"stddev_p99"`
+	ZScore      float64 `json:"z_score"`
+	HasBaseline bool    `json:"has_baseline"`
+}
+
+// AnomalyScores computes z-scores for all active endpoints by comparing the
+// current window P99 against the mean and stddev of the last n complete
+// historical windows. Endpoints with fewer than 3 historical data points
+// return HasBaseline=false. Results are sorted by ZScore descending.
+func (e *Engine) AnomalyScores(n int) ([]AnomalyScore, error) {
+	if n < 3 {
+		n = 3
+	}
+	now := time.Now()
+
+	// Current P99 per endpoint.
+	current, err := e.Table()
+	if err != nil {
+		return nil, err
+	}
+	if len(current) == 0 {
+		return []AnomalyScore{}, nil
+	}
+
+	// Fetch all historical windows in one DB read, then bucket in Go.
+	bigFrom := now.Add(-time.Duration(n+1) * e.window)
+	bigTo := now.Add(-e.window)
+	historical, err := e.reader.FindByWindow(bigFrom, bigTo)
+	if err != nil {
+		return nil, err
+	}
+
+	type key struct{ method, path string }
+
+	// Group durations by (endpoint, window-index).
+	windowDurs := make(map[key]map[int][]float64)
+	for _, r := range historical {
+		// window index 0 = most recent historical window, n-1 = oldest.
+		age := bigTo.Sub(r.Timestamp)
+		idx := int(age / e.window)
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= n {
+			continue
+		}
+		k := key{r.Method, r.Path}
+		if windowDurs[k] == nil {
+			windowDurs[k] = make(map[int][]float64)
+		}
+		windowDurs[k][idx] = append(windowDurs[k][idx], r.DurationMs)
+	}
+
+	// Compute per-window P99s, then mean+stddev.
+	type stats struct{ mean, stddev float64; count int }
+	endpointStats := make(map[key]stats)
+	for k, byWindow := range windowDurs {
+		var p99s []float64
+		for _, durs := range byWindow {
+			sort.Float64s(durs)
+			p99s = append(p99s, pct(durs, 99))
+		}
+		if len(p99s) == 0 {
+			continue
+		}
+		var sum float64
+		for _, v := range p99s {
+			sum += v
+		}
+		mean := sum / float64(len(p99s))
+		var variance float64
+		for _, v := range p99s {
+			d := v - mean
+			variance += d * d
+		}
+		stddev := math.Sqrt(variance / float64(len(p99s)))
+		endpointStats[k] = stats{mean: mean, stddev: stddev, count: len(p99s)}
+	}
+
+	scores := make([]AnomalyScore, 0, len(current))
+	for _, row := range current {
+		k := key{row.Method, row.Path}
+		st, ok := endpointStats[k]
+		if !ok || st.count < 3 {
+			scores = append(scores, AnomalyScore{
+				Method: row.Method, Path: row.Path,
+				CurrentP99: math.Round(row.P99*100) / 100,
+				HasBaseline: false,
+			})
+			continue
+		}
+		var z float64
+		if st.stddev > 0 {
+			z = (row.P99 - st.mean) / st.stddev
+		}
+		scores = append(scores, AnomalyScore{
+			Method:      row.Method,
+			Path:        row.Path,
+			CurrentP99:  math.Round(row.P99*100) / 100,
+			MeanP99:     math.Round(st.mean*100) / 100,
+			StddevP99:   math.Round(st.stddev*100) / 100,
+			ZScore:      math.Round(z*100) / 100,
+			HasBaseline: true,
+		})
+	}
+	sort.Slice(scores, func(i, j int) bool { return scores[i].ZScore > scores[j].ZScore })
+	return scores, nil
 }
 
 // pct computes the p-th percentile (0–100) of a sorted slice using the

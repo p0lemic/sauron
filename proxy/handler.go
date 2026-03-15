@@ -14,7 +14,17 @@ import (
 	"time"
 
 	"api-profiler/storage"
+	traceCtx "api-profiler/trace"
 )
+
+// traceKey is the context key for trace IDs stored during ServeHTTP.
+type traceKey struct{}
+
+// traceIDs holds the trace and span IDs for a single request hop.
+type traceIDs struct {
+	traceID string
+	spanID  string
+}
 
 // Config contains the proxy configuration.
 type Config struct {
@@ -25,6 +35,7 @@ type Config struct {
 	TLSSkipVerify  bool
 	Normalizer     func(string) string // nil disables path normalization
 	RewriteHeaders func(http.Header)   // nil disables header rewriting
+	TraceContext   bool                // propagate W3C TraceContext headers
 }
 
 // Handler implements http.Handler. It forwards requests to the upstream
@@ -76,6 +87,12 @@ func New(cfg Config) (*Handler, error) {
 			if cfg.RewriteHeaders != nil {
 				cfg.RewriteHeaders(req.Header)
 			}
+			// Propagate W3C TraceContext using IDs generated in ServeHTTP.
+			if cfg.TraceContext {
+				if ids, ok := req.Context().Value(traceKey{}).(traceIDs); ok {
+					req.Header.Set("Traceparent", traceCtx.FormatTraceparent(ids.traceID, ids.spanID))
+				}
+			}
 		},
 		Transport: &timeoutTransport{
 			transport: baseTransport,
@@ -99,6 +116,21 @@ func New(cfg Config) (*Handler, error) {
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	// Extract or generate W3C TraceContext IDs before proxying so they are
+	// available to both the Director (for propagation) and the Recorder.
+	var tid, sid string
+	if h.cfg.TraceContext {
+		existingTraceID, _, ok := traceCtx.ParseTraceparent(r.Header.Get("Traceparent"))
+		if ok {
+			tid = existingTraceID
+		} else {
+			tid = traceCtx.NewTraceID()
+		}
+		sid = traceCtx.NewSpanID()
+		r = r.WithContext(context.WithValue(r.Context(), traceKey{}, traceIDs{tid, sid}))
+	}
+
 	sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
 	h.rp.ServeHTTP(sw, r)
 	durationMs := float64(time.Since(start).Microseconds()) / 1000
@@ -114,6 +146,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Path:       path,
 			StatusCode: sw.code,
 			DurationMs: durationMs,
+			TraceID:    tid,
+			SpanID:     sid,
 		})
 	}
 }

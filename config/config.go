@@ -11,6 +11,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// WebhookConfig defines one webhook destination.
+type WebhookConfig struct {
+	URL    string   `yaml:"url"`
+	Format string   `yaml:"format"` // "json" (default) | "slack"
+	Events []string `yaml:"events"` // ["fired"] | ["resolved"] | both; default ["fired"]
+}
+
 // PathRule defines a custom path normalization rule.
 type PathRule struct {
 	Pattern     string
@@ -54,6 +61,13 @@ type Config struct {
 	HealthCheck             HealthCheckConfig
 	ErrorRateThreshold      float64 // percentage; 0 = disabled
 	ThroughputDropThreshold float64 // minimum RPS % of baseline; 0 = disabled
+	ApdexT                  int     // Apdex satisfaction threshold in ms (default: 500)
+	TraceContext            bool    // enable W3C TraceContext propagation (default: true)
+	// US-48
+	AnomalySensitivity  float64 // z-score threshold for statistical anomaly (default: 2.0)
+	StatisticalWindows  int     // number of historical windows for z-score (default: 10)
+	// US-49
+	Webhooks []WebhookConfig // multi-target webhooks; supersedes WebhookURL when non-empty
 }
 
 // Default returns a Config with all default values applied.
@@ -69,7 +83,23 @@ func Default() Config {
 		StorageDriver:    "sqlite",
 		StorageDSN:       "profiler.db",
 		NormalizePaths:   true,
+		ApdexT:             500,
+		TraceContext:       true,
+		AnomalySensitivity: 2.0,
+		StatisticalWindows: 10,
 	}
+}
+
+// EffectiveWebhooks returns the resolved list of webhook targets, collapsing
+// the legacy WebhookURL field into Webhooks when Webhooks is empty.
+func (c Config) EffectiveWebhooks() []WebhookConfig {
+	if len(c.Webhooks) > 0 {
+		return c.Webhooks
+	}
+	if c.WebhookURL != "" {
+		return []WebhookConfig{{URL: c.WebhookURL, Format: "json", Events: []string{"fired"}}}
+	}
+	return nil
 }
 
 // yamlStorage is the nested storage block in the YAML config.
@@ -117,6 +147,11 @@ type yamlFile struct {
 	HealthCheck        yamlHealthCheck  `yaml:"health_check"`
 	ErrorRateThreshold      float64 `yaml:"error_rate_threshold"`
 	ThroughputDropThreshold float64 `yaml:"throughput_drop_threshold"`
+	MetricsApdexT           int              `yaml:"metrics_apdex_t"`
+	TraceContext            *bool            `yaml:"trace_context"` // pointer to distinguish false from unset
+	AnomalySensitivity      float64          `yaml:"anomaly_sensitivity"`
+	StatisticalWindows      int              `yaml:"statistical_windows"`
+	Webhooks                []WebhookConfig  `yaml:"webhooks"`
 }
 
 // Load reads the YAML file at path and returns a Config with defaults applied
@@ -237,6 +272,21 @@ func Load(path string) (Config, error) {
 	if yf.ThroughputDropThreshold != 0 {
 		cfg.ThroughputDropThreshold = yf.ThroughputDropThreshold
 	}
+	if yf.MetricsApdexT != 0 {
+		cfg.ApdexT = yf.MetricsApdexT
+	}
+	if yf.TraceContext != nil {
+		cfg.TraceContext = *yf.TraceContext
+	}
+	if yf.AnomalySensitivity != 0 {
+		cfg.AnomalySensitivity = yf.AnomalySensitivity
+	}
+	if yf.StatisticalWindows != 0 {
+		cfg.StatisticalWindows = yf.StatisticalWindows
+	}
+	if len(yf.Webhooks) > 0 {
+		cfg.Webhooks = yf.Webhooks
+	}
 
 	return cfg, nil
 }
@@ -314,6 +364,18 @@ func Merge(base, overrides Config) Config {
 	if overrides.ThroughputDropThreshold != 0 {
 		result.ThroughputDropThreshold = overrides.ThroughputDropThreshold
 	}
+	if overrides.ApdexT != 0 {
+		result.ApdexT = overrides.ApdexT
+	}
+	if overrides.AnomalySensitivity != 0 {
+		result.AnomalySensitivity = overrides.AnomalySensitivity
+	}
+	if overrides.StatisticalWindows != 0 {
+		result.StatisticalWindows = overrides.StatisticalWindows
+	}
+	if len(overrides.Webhooks) > 0 {
+		result.Webhooks = overrides.Webhooks
+	}
 	return result
 }
 
@@ -351,10 +413,25 @@ func Validate(cfg Config) error {
 	if cfg.AnomalyThreshold <= 0 {
 		return fmt.Errorf("anomaly_threshold must be positive, got %v", cfg.AnomalyThreshold)
 	}
+	if cfg.AnomalySensitivity <= 0 {
+		return fmt.Errorf("anomaly_sensitivity must be positive, got %v", cfg.AnomalySensitivity)
+	}
+	if cfg.StatisticalWindows < 3 {
+		return fmt.Errorf("statistical_windows must be >= 3, got %d", cfg.StatisticalWindows)
+	}
 	if cfg.WebhookURL != "" {
 		u, err := url.Parse(cfg.WebhookURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 			return fmt.Errorf("webhook_url must be an http/https URL, got %q", cfg.WebhookURL)
+		}
+	}
+	for i, wh := range cfg.Webhooks {
+		u, err := url.Parse(wh.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("webhooks[%d].url must be an http/https URL, got %q", i, wh.URL)
+		}
+		if wh.Format != "" && wh.Format != "json" && wh.Format != "slack" {
+			return fmt.Errorf("webhooks[%d].format must be json or slack, got %q", i, wh.Format)
 		}
 	}
 	driver := cfg.StorageDriver
@@ -403,10 +480,25 @@ func ValidateDashboard(cfg Config) error {
 	if cfg.AnomalyThreshold <= 0 {
 		return fmt.Errorf("anomaly_threshold must be positive, got %v", cfg.AnomalyThreshold)
 	}
+	if cfg.AnomalySensitivity <= 0 {
+		return fmt.Errorf("anomaly_sensitivity must be positive, got %v", cfg.AnomalySensitivity)
+	}
+	if cfg.StatisticalWindows < 3 {
+		return fmt.Errorf("statistical_windows must be >= 3, got %d", cfg.StatisticalWindows)
+	}
 	if cfg.WebhookURL != "" {
 		u, err := url.Parse(cfg.WebhookURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 			return fmt.Errorf("webhook_url must be an http/https URL, got %q", cfg.WebhookURL)
+		}
+	}
+	for i, wh := range cfg.Webhooks {
+		u, err := url.Parse(wh.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("webhooks[%d].url must be an http/https URL, got %q", i, wh.URL)
+		}
+		if wh.Format != "" && wh.Format != "json" && wh.Format != "slack" {
+			return fmt.Errorf("webhooks[%d].format must be json or slack, got %q", i, wh.Format)
 		}
 	}
 	return nil

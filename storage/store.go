@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -15,6 +16,8 @@ type Record struct {
 	Path       string    `json:"path"`
 	StatusCode int       `json:"status_code"`
 	DurationMs float64   `json:"duration_ms"`
+	TraceID    string    `json:"trace_id"`
+	SpanID     string    `json:"span_id"`
 }
 
 // Store persists request records.
@@ -65,18 +68,36 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	if err := sqliteAddColumnIfNotExists(db, "requests", "trace_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := sqliteAddColumnIfNotExists(db, "requests", "span_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
+}
+
+// sqliteAddColumnIfNotExists runs ALTER TABLE ADD COLUMN and ignores the error
+// if the column already exists (SQLite reports "duplicate column name").
+func sqliteAddColumnIfNotExists(db *sql.DB, table, column, def string) error {
+	_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, def))
+	if err != nil && strings.Contains(err.Error(), "duplicate column name") {
+		return nil
+	}
+	return err
 }
 
 func (s *sqliteStore) Save(r Record) error {
 	_, err := s.db.Exec(
-		`INSERT INTO requests (timestamp, method, path, status_code, duration_ms)
-		 VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO requests (timestamp, method, path, status_code, duration_ms, trace_id, span_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		r.Timestamp.UTC().Format(time.RFC3339Nano),
 		r.Method,
 		r.Path,
 		r.StatusCode,
 		r.DurationMs,
+		r.TraceID,
+		r.SpanID,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: insert: %w", err)
