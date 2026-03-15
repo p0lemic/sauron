@@ -1,0 +1,37 @@
+# Standalone Sauron stack.
+# For integrating into an existing project see docker-compose.example.yml.
+#
+# Usage:
+#   UPSTREAM=http://host.docker.internal:3000 docker compose up
+
+services:
+
+  proxy:
+    build: .
+    command: ["./profiler"]
+    environment:
+      PROFILER_UPSTREAM:    "${UPSTREAM:-http://host.docker.internal:3000}"
+      PROFILER_PORT:        "8080"
+      PROFILER_STORAGE_DSN: "/data/profiler.db"
+    ports:
+      - "${PROXY_PORT:-8080}:8080"
+    volumes:
+      - sauron-data:/data
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: ["./dashboard"]
+    environment:
+      PROFILER_STORAGE_DSN: "/data/profiler.db"
+      PROFILER_API_ADDR:    ":9090"
+    ports:
+      - "${DASHBOARD_PORT:-9090}:9090"
+    volumes:
+      - sauron-data:/data
+    depends_on:
+      - proxy
+    restart: unless-stopped
+
+volumes:
+  sauron-data:

@@ -17,7 +17,16 @@
       "Bash(cat:*)",
       "Bash(sed:*)",
       "Bash(echo no docx:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(go install:*)",
+      "Bash(go version:*)",
+      "Bash(brew install:*)",
+      "Bash(which air:*)",
+      "Bash(air:*)",
+      "Bash(which watchexec:*)",
+      "Bash(mkdir:*)",
+      "Bash(make build:*)"
     ]
   }
 }
