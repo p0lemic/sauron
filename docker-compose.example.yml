@@ -1,24 +1,45 @@
 # ── Sauron integration example ────────────────────────────────────────────────
 #
-# Drop these two services into your project's docker-compose.yml.
-# Traffic flow: client → sauron-proxy:8080 → your-app:3000
+# Drop these services into your project's docker-compose.yml.
+#
+# Traffic flow (normal):  client → nginx:80 → sauron-proxy:8080 → app:3000
+# Traffic flow (fallback): client → nginx:80 → app:3000 (when Sauron is down)
 # Dashboard:    http://localhost:9090
 #
 # Steps:
-#   1. Copy the `sauron-proxy`, `sauron-dashboard` services and the
-#      `sauron-data` volume into your docker-compose.yml.
-#   2. Point PROFILER_UPSTREAM at your app's internal service name.
-#   3. Send traffic to sauron-proxy instead of your app directly.
+#   1. Copy the `sauron-nginx`, `sauron-proxy`, `sauron-dashboard` services and
+#      the `sauron-data` volume into your docker-compose.yml.
+#   2. Copy nginx.conf from the Sauron repo and adjust UPSTREAM_HOST/UPSTREAM_PORT.
+#   3. Send traffic to nginx:80 instead of your app directly.
+#   4. Your app does NOT need to expose a port to the host.
 
 services:
 
-  # Your existing app — unchanged.
+  # Your existing app — unchanged (no port exposed to host; nginx reaches it internally).
   app:
     build: .
-    ports:
-      - "3000:3000"
 
   # ── Sauron ──────────────────────────────────────────────────────────────────
+
+  sauron-nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"   # clients hit this
+    volumes:
+      - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      UPSTREAM_HOST: "app"    # internal Docker service name
+      UPSTREAM_PORT: "3000"   # port your app listens on
+    depends_on:
+      - sauron-proxy
+      - app
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   sauron-proxy:
     image: ghcr.io/your-org/sauron:latest   # or `build: ./sauron`
@@ -27,13 +48,20 @@ services:
       PROFILER_UPSTREAM:    "http://app:3000"   # internal service name
       PROFILER_PORT:        "8080"
       PROFILER_STORAGE_DSN: "/data/profiler.db"
-    ports:
-      - "8080:8080"   # clients hit this instead of app:3000
+    # Not exposed to host — only sauron-nginx reaches it.
+    expose:
+      - "8080"
     volumes:
       - sauron-data:/data
     depends_on:
       - app
-    restart: unless-stopped
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/_sauron/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   sauron-dashboard:
     image: ghcr.io/your-org/sauron:latest   # or `build: ./sauron`
@@ -47,7 +75,7 @@ services:
       - sauron-data:/data
     depends_on:
       - sauron-proxy
-    restart: unless-stopped
+    restart: always
 
 volumes:
   sauron-data:

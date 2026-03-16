@@ -68,6 +68,7 @@ type Config struct {
 	StatisticalWindows  int     // number of historical windows for z-score (default: 10)
 	// US-49
 	Webhooks []WebhookConfig // multi-target webhooks; supersedes WebhookURL when non-empty
+	HealthPath string // proxy-local health path (default: /_sauron/health); "" disables
 }
 
 // Default returns a Config with all default values applied.
@@ -87,6 +88,7 @@ func Default() Config {
 		TraceContext:       true,
 		AnomalySensitivity: 2.0,
 		StatisticalWindows: 10,
+		HealthPath:         "/_sauron/health",
 	}
 }
 
@@ -152,6 +154,7 @@ type yamlFile struct {
 	AnomalySensitivity      float64          `yaml:"anomaly_sensitivity"`
 	StatisticalWindows      int              `yaml:"statistical_windows"`
 	Webhooks                []WebhookConfig  `yaml:"webhooks"`
+	HealthPath              string           `yaml:"health_path"`
 }
 
 // Load reads the YAML file at path and returns a Config with defaults applied
@@ -287,6 +290,9 @@ func Load(path string) (Config, error) {
 	if len(yf.Webhooks) > 0 {
 		cfg.Webhooks = yf.Webhooks
 	}
+	if yf.HealthPath != "" {
+		cfg.HealthPath = yf.HealthPath
+	}
 
 	return cfg, nil
 }
@@ -375,6 +381,9 @@ func Merge(base, overrides Config) Config {
 	}
 	if len(overrides.Webhooks) > 0 {
 		result.Webhooks = overrides.Webhooks
+	}
+	if overrides.HealthPath != "" {
+		result.HealthPath = overrides.HealthPath
 	}
 	return result
 }

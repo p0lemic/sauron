@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"runtime"
 	"strings"
 	"time"
 
@@ -36,6 +37,7 @@ type Config struct {
 	Normalizer     func(string) string // nil disables path normalization
 	RewriteHeaders func(http.Header)   // nil disables header rewriting
 	TraceContext   bool                // propagate W3C TraceContext headers
+	HealthPath     string              // path answered locally without hitting upstream (e.g. /_sauron/health)
 }
 
 // Handler implements http.Handler. It forwards requests to the upstream
@@ -115,6 +117,23 @@ func New(cfg Config) (*Handler, error) {
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			buf := make([]byte, 64<<10)
+			n := runtime.Stack(buf, false)
+			log.Printf("panic in proxy handler: %v\n%s", rec, buf[:n])
+			http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
+		}
+	}()
+
+	// Respond to health checks locally without touching the upstream.
+	if h.cfg.HealthPath != "" && r.URL.Path == h.cfg.HealthPath {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		return
+	}
+
 	start := time.Now()
 
 	// Extract or generate W3C TraceContext IDs before proxying so they are

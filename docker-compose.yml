@@ -3,8 +3,31 @@
 #
 # Usage:
 #   UPSTREAM=http://host.docker.internal:3000 docker compose up
+#
+# Traffic flow (normal):  client → nginx:80 → sauron-proxy:8080 → upstream
+# Traffic flow (fallback): client → nginx:80 → upstream (when Sauron is down)
 
 services:
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "${PROXY_PORT:-80}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      UPSTREAM_HOST: "${UPSTREAM_HOST:-host.docker.internal}"
+      UPSTREAM_PORT: "${UPSTREAM_PORT:-3000}"
+    depends_on:
+      proxy:
+        condition: service_started
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   proxy:
     build: .
@@ -13,11 +36,18 @@ services:
       PROFILER_UPSTREAM:    "${UPSTREAM:-http://host.docker.internal:3000}"
       PROFILER_PORT:        "8080"
       PROFILER_STORAGE_DSN: "/data/profiler.db"
-    ports:
-      - "${PROXY_PORT:-8080}:8080"
+    # Port not exposed to host — only nginx reaches sauron-proxy.
+    expose:
+      - "8080"
     volumes:
       - sauron-data:/data
-    restart: unless-stopped
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/_sauron/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   dashboard:
     build: .
@@ -31,7 +61,7 @@ services:
       - sauron-data:/data
     depends_on:
       - proxy
-    restart: unless-stopped
+    restart: always
 
 volumes:
   sauron-data:

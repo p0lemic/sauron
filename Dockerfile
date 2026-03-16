@@ -28,6 +28,9 @@ RUN mkdir /data
 
 EXPOSE 8080 9090
 
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -qO- http://localhost:8080/_sauron/health || exit 1
+
 # Default: run the proxy. Override with:
 #   command: ["./dashboard"]
 CMD ["./profiler"]

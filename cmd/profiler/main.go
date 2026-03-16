@@ -30,6 +30,7 @@ func main() {
 	storageDSNFlag := flag.String("storage-dsn", "", "storage DSN: file path for sqlite, connection string for postgres (default: profiler.db)")
 	retentionFlag := flag.Duration("retention", 0, "how long to keep request records, e.g. 7d, 24h (default: 0 = disabled)")
 	noTraceContextFlag := flag.Bool("no-trace-context", false, "disable W3C TraceContext header propagation")
+	healthPathFlag := flag.String("health-path", "", "proxy-local health check path (default: /_sauron/health); set to empty string to disable")
 
 	if cp := findConfigFlag(os.Args[1:]); cp != "" && *configPath == "" {
 		*configPath = cp
@@ -70,6 +71,8 @@ func main() {
 			overrides.StorageDSN = *storageDSNFlag
 		case "retention":
 			overrides.Retention = *retentionFlag
+		case "health-path":
+			overrides.HealthPath = *healthPathFlag
 		}
 	})
 
@@ -144,6 +147,7 @@ func main() {
 		Normalizer:     normFn,
 		RewriteHeaders: rewriteFn,
 		TraceContext:   cfg.TraceContext,
+		HealthPath:     cfg.HealthPath,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

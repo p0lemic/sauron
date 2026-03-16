@@ -26,7 +26,8 @@
       "Bash(air:*)",
       "Bash(which watchexec:*)",
       "Bash(mkdir:*)",
-      "Bash(make build:*)"
+      "Bash(make build:*)",
+      "Bash(git stash:*)"
     ]
   }
 }
