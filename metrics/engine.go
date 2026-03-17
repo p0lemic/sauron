@@ -1001,6 +1001,94 @@ func (e *Engine) AnomalyScores(n int) ([]AnomalyScore, error) {
 	return scores, nil
 }
 
+// TraceSummary holds aggregated information about a distributed trace.
+type TraceSummary struct {
+	TraceID         string    `json:"trace_id"`
+	StartTime       time.Time `json:"start_time"`
+	EndTime         time.Time `json:"end_time"`
+	TotalDurationMs float64   `json:"total_duration_ms"`
+	SpanCount       int       `json:"span_count"`
+	HasErrors       bool      `json:"has_errors"`
+}
+
+// Traces returns a summary of all unique traces active in the engine's window,
+// ordered by start_time descending (most recent first). Traces with an empty
+// trace_id are excluded.
+func (e *Engine) Traces() ([]TraceSummary, error) {
+	now := time.Now()
+	return e.TracesForRange(now.Add(-e.window), now)
+}
+
+// TracesForRange returns trace summaries for records in [from, to).
+func (e *Engine) TracesForRange(from, to time.Time) ([]TraceSummary, error) {
+	records, err := e.reader.FindByWindow(from, to)
+	if err != nil {
+		return nil, err
+	}
+
+	type agg struct {
+		start     time.Time
+		end       time.Time
+		spanCount int
+		hasErrors bool
+	}
+	m := make(map[string]*agg)
+	order := []string{} // preserve first-seen order for determinism
+
+	for _, r := range records {
+		if r.TraceID == "" {
+			continue
+		}
+		a, ok := m[r.TraceID]
+		if !ok {
+			a = &agg{start: r.Timestamp, end: r.Timestamp}
+			m[r.TraceID] = a
+			order = append(order, r.TraceID)
+		}
+		if r.Timestamp.Before(a.start) {
+			a.start = r.Timestamp
+		}
+		spanEnd := r.Timestamp.Add(time.Duration(r.DurationMs * float64(time.Millisecond)))
+		if spanEnd.After(a.end) {
+			a.end = spanEnd
+		}
+		a.spanCount++
+		if r.StatusCode >= 400 {
+			a.hasErrors = true
+		}
+	}
+
+	out := make([]TraceSummary, 0, len(m))
+	for _, id := range order {
+		a := m[id]
+		totalMs := float64(a.end.Sub(a.start).Microseconds()) / 1000
+		out = append(out, TraceSummary{
+			TraceID:         id,
+			StartTime:       a.start,
+			EndTime:         a.end,
+			TotalDurationMs: totalMs,
+			SpanCount:       a.spanCount,
+			HasErrors:       a.hasErrors,
+		})
+	}
+
+	// Sort by start time descending (newest first).
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].StartTime.After(out[j].StartTime)
+	})
+	return out, nil
+}
+
+// TraceSpans returns all proxy-level spans for a given trace_id, ordered by timestamp ASC.
+func (e *Engine) TraceSpans(traceID string) ([]storage.Record, error) {
+	return e.reader.FindByTraceID(traceID)
+}
+
+// InnerSpans returns all application-level spans for a given trace_id, ordered by start_time ASC.
+func (e *Engine) InnerSpans(traceID string) ([]storage.InnerSpan, error) {
+	return e.reader.FindSpansByTraceID(traceID)
+}
+
 // pct computes the p-th percentile (0–100) of a sorted slice using the
 // nearest-rank method (1-indexed, ceil). Single-element slices return that element.
 func pct(sorted []float64, p float64) float64 {

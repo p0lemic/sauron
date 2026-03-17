@@ -35,6 +35,23 @@ func (r *splitReader) FindRecent(_ time.Time, _ time.Time, limit int) ([]storage
 	return out, nil
 }
 
+func (r *splitReader) FindByTraceID(traceID string) ([]storage.Record, error) {
+	var out []storage.Record
+	for _, rec := range r.currentRecords {
+		if rec.TraceID == traceID {
+			out = append(out, rec)
+		}
+	}
+	if out == nil {
+		out = []storage.Record{}
+	}
+	return out, nil
+}
+
+func (r *splitReader) FindSpansByTraceID(_ string) ([]storage.InnerSpan, error) {
+	return []storage.InnerSpan{}, nil
+}
+
 func makeRecs(method, path string, durations []float64) []storage.Record {
 	out := make([]storage.Record, len(durations))
 	for i, d := range durations {

@@ -42,8 +42,23 @@ func migratePG(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_path_method ON requests (method, path)`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_timestamp   ON requests (timestamp)`,
-		`ALTER TABLE requests ADD COLUMN IF NOT EXISTS trace_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE requests ADD COLUMN IF NOT EXISTS span_id  TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN IF NOT EXISTS trace_id       TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN IF NOT EXISTS span_id        TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE requests ADD COLUMN IF NOT EXISTS parent_span_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_requests_trace_id ON requests (trace_id)`,
+		`CREATE TABLE IF NOT EXISTS spans (
+			id             BIGSERIAL        PRIMARY KEY,
+			trace_id       TEXT             NOT NULL,
+			span_id        TEXT             NOT NULL,
+			parent_span_id TEXT             NOT NULL DEFAULT '',
+			name           TEXT             NOT NULL,
+			kind           TEXT             NOT NULL DEFAULT '',
+			start_time     TIMESTAMPTZ      NOT NULL,
+			duration_ms    DOUBLE PRECISION NOT NULL,
+			attributes     TEXT             NOT NULL DEFAULT '{}',
+			status         TEXT             NOT NULL DEFAULT 'ok'
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_spans_trace_id ON spans (trace_id)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -55,8 +70,8 @@ func migratePG(db *sql.DB) error {
 
 func (s *postgresStore) Save(r Record) error {
 	_, err := s.db.Exec(
-		`INSERT INTO requests (timestamp, method, path, status_code, duration_ms, trace_id, span_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		`INSERT INTO requests (timestamp, method, path, status_code, duration_ms, trace_id, span_id, parent_span_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		r.Timestamp.UTC(),
 		r.Method,
 		r.Path,
@@ -64,6 +79,7 @@ func (s *postgresStore) Save(r Record) error {
 		r.DurationMs,
 		r.TraceID,
 		r.SpanID,
+		r.ParentSpanID,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: insert: %w", err)
@@ -73,7 +89,7 @@ func (s *postgresStore) Save(r Record) error {
 
 func (s *postgresStore) FindByWindow(from, to time.Time) ([]Record, error) {
 	rows, err := s.db.Query(
-		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id
+		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id, parent_span_id
 		 FROM requests
 		 WHERE timestamp >= $1 AND timestamp < $2
 		 ORDER BY timestamp`,
@@ -89,7 +105,7 @@ func (s *postgresStore) FindByWindow(from, to time.Time) ([]Record, error) {
 	for rows.Next() {
 		var rec Record
 		var ts time.Time
-		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs, &rec.TraceID, &rec.SpanID); err != nil {
+		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs, &rec.TraceID, &rec.SpanID, &rec.ParentSpanID); err != nil {
 			return nil, fmt.Errorf("storage: scan: %w", err)
 		}
 		rec.Timestamp = ts.UTC()
@@ -100,7 +116,7 @@ func (s *postgresStore) FindByWindow(from, to time.Time) ([]Record, error) {
 
 func (s *postgresStore) FindRecent(from, to time.Time, limit int) ([]Record, error) {
 	rows, err := s.db.Query(
-		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id
+		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id, parent_span_id
 		 FROM requests
 		 WHERE timestamp >= $1 AND timestamp < $2
 		 ORDER BY timestamp DESC
@@ -118,11 +134,85 @@ func (s *postgresStore) FindRecent(from, to time.Time, limit int) ([]Record, err
 	for rows.Next() {
 		var rec Record
 		var ts time.Time
-		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs, &rec.TraceID, &rec.SpanID); err != nil {
+		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs, &rec.TraceID, &rec.SpanID, &rec.ParentSpanID); err != nil {
 			return nil, fmt.Errorf("storage: FindRecent scan: %w", err)
 		}
 		rec.Timestamp = ts.UTC()
 		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) FindByTraceID(traceID string) ([]Record, error) {
+	rows, err := s.db.Query(
+		`SELECT timestamp, method, path, status_code, duration_ms, trace_id, span_id, parent_span_id
+		 FROM requests
+		 WHERE trace_id = $1
+		 ORDER BY timestamp ASC`,
+		traceID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("storage: FindByTraceID: %w", err)
+	}
+	defer rows.Close()
+
+	out := []Record{}
+	for rows.Next() {
+		var rec Record
+		var ts time.Time
+		if err := rows.Scan(&ts, &rec.Method, &rec.Path, &rec.StatusCode, &rec.DurationMs, &rec.TraceID, &rec.SpanID, &rec.ParentSpanID); err != nil {
+			return nil, fmt.Errorf("storage: FindByTraceID scan: %w", err)
+		}
+		rec.Timestamp = ts.UTC()
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) SaveSpan(sp InnerSpan) error {
+	_, err := s.db.Exec(
+		`INSERT INTO spans (trace_id, span_id, parent_span_id, name, kind, start_time, duration_ms, attributes, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		sp.TraceID,
+		sp.SpanID,
+		sp.ParentSpanID,
+		sp.Name,
+		sp.Kind,
+		sp.StartTime.UTC(),
+		sp.DurationMs,
+		encodeAttrs(sp.Attributes),
+		sp.Status,
+	)
+	if err != nil {
+		return fmt.Errorf("storage: SaveSpan: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) FindSpansByTraceID(traceID string) ([]InnerSpan, error) {
+	rows, err := s.db.Query(
+		`SELECT trace_id, span_id, parent_span_id, name, kind, start_time, duration_ms, attributes, status
+		 FROM spans
+		 WHERE trace_id = $1
+		 ORDER BY start_time ASC`,
+		traceID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("storage: FindSpansByTraceID: %w", err)
+	}
+	defer rows.Close()
+
+	out := []InnerSpan{}
+	for rows.Next() {
+		var sp InnerSpan
+		var ts time.Time
+		var attrs string
+		if err := rows.Scan(&sp.TraceID, &sp.SpanID, &sp.ParentSpanID, &sp.Name, &sp.Kind, &ts, &sp.DurationMs, &attrs, &sp.Status); err != nil {
+			return nil, fmt.Errorf("storage: FindSpansByTraceID scan: %w", err)
+		}
+		sp.StartTime = ts.UTC()
+		sp.Attributes = decodeAttrs(attrs)
+		out = append(out, sp)
 	}
 	return out, rows.Err()
 }

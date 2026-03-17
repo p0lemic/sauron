@@ -32,7 +32,7 @@ func startDashboard(t *testing.T) (*api.Server, string) {
 	detector.Start()
 	t.Cleanup(detector.Stop)
 
-	srv := api.NewServer(engine, "localhost:0", cfg.BaselineWindows, cfg.ApdexT, detector, nil)
+	srv := api.NewServer(engine, nil, "localhost:0", cfg.BaselineWindows, cfg.ApdexT, detector, nil)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() {
 		srv.Shutdown(context.Background()) //nolint:errcheck
@@ -76,7 +76,7 @@ func TestDashboardMetricsSummary(t *testing.T) {
 	detector.Start()
 	defer detector.Stop()
 
-	srv := api.NewServer(engine, "localhost:0", cfg.BaselineWindows, cfg.ApdexT, detector, nil)
+	srv := api.NewServer(engine, nil, "localhost:0", cfg.BaselineWindows, cfg.ApdexT, detector, nil)
 	require.NoError(t, srv.Start())
 	defer srv.Shutdown(context.Background()) //nolint:errcheck
 

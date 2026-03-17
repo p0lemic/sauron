@@ -38,6 +38,25 @@ func (m *mockReader) FindRecent(_ time.Time, _ time.Time, limit int) ([]storage.
 	return out, nil
 }
 
+func (m *mockReader) FindByTraceID(traceID string) ([]storage.Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []storage.Record
+	for _, r := range m.records {
+		if r.TraceID == traceID {
+			out = append(out, r)
+		}
+	}
+	if out == nil {
+		out = []storage.Record{}
+	}
+	return out, nil
+}
+
+func (m *mockReader) FindSpansByTraceID(_ string) ([]storage.InnerSpan, error) {
+	return []storage.InnerSpan{}, nil
+}
+
 func (m *mockReader) captured() (time.Time, time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

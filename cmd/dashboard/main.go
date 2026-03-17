@@ -140,7 +140,7 @@ func main() {
 		log.Printf("health check enabled: target=%s interval=%s", cfg.Upstream+path, interval)
 	}
 
-	apiSrv := api.NewServer(engine, cfg.APIAddr, cfg.BaselineWindows, cfg.ApdexT, detector, checker)
+	apiSrv := api.NewServer(engine, store, cfg.APIAddr, cfg.BaselineWindows, cfg.ApdexT, detector, checker)
 	if err := apiSrv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: starting dashboard server: %v\n", err)
 		os.Exit(1)

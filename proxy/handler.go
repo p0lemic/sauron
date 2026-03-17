@@ -23,8 +23,9 @@ type traceKey struct{}
 
 // traceIDs holds the trace and span IDs for a single request hop.
 type traceIDs struct {
-	traceID string
-	spanID  string
+	traceID      string
+	spanID       string
+	parentSpanID string
 }
 
 // Config contains the proxy configuration.
@@ -138,16 +139,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Extract or generate W3C TraceContext IDs before proxying so they are
 	// available to both the Director (for propagation) and the Recorder.
-	var tid, sid string
+	var tid, sid, parentSid string
 	if h.cfg.TraceContext {
-		existingTraceID, _, ok := traceCtx.ParseTraceparent(r.Header.Get("Traceparent"))
+		existingTraceID, incomingParentID, ok := traceCtx.ParseTraceparent(r.Header.Get("Traceparent"))
 		if ok {
 			tid = existingTraceID
+			parentSid = incomingParentID
 		} else {
 			tid = traceCtx.NewTraceID()
 		}
 		sid = traceCtx.NewSpanID()
-		r = r.WithContext(context.WithValue(r.Context(), traceKey{}, traceIDs{tid, sid}))
+		r = r.WithContext(context.WithValue(r.Context(), traceKey{}, traceIDs{tid, sid, parentSid}))
 	}
 
 	sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
@@ -160,13 +162,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			path = h.cfg.Normalizer(path)
 		}
 		h.cfg.Recorder.Record(storage.Record{
-			Timestamp:  start,
-			Method:     r.Method,
-			Path:       path,
-			StatusCode: sw.code,
-			DurationMs: durationMs,
-			TraceID:    tid,
-			SpanID:     sid,
+			Timestamp:    start,
+			Method:       r.Method,
+			Path:         path,
+			StatusCode:   sw.code,
+			DurationMs:   durationMs,
+			TraceID:      tid,
+			SpanID:       sid,
+			ParentSpanID: parentSid,
 		})
 	}
 }

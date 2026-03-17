@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"api-profiler/alerts"
@@ -23,6 +24,7 @@ var dashboardFS embed.FS
 // Server is the internal HTTP server for metrics queries and the dashboard.
 type Server struct {
 	engine          *metrics.Engine
+	store           storage.Store // for ingest endpoints; may be nil
 	baselineWindows int
 	apdexT          int
 	detector        *alerts.Detector
@@ -37,11 +39,12 @@ type Server struct {
 // apdexT is the default Apdex satisfaction threshold in ms (0 → use 500).
 // detector provides active alert data for GET /alerts/active.
 // checker is optional (nil = disabled); when non-nil, GET /health includes upstream state.
-func NewServer(engine *metrics.Engine, addr string, baselineWindows int, apdexT int, detector *alerts.Detector, checker *health.Checker) *Server {
+// store is optional (nil = ingest disabled); when non-nil, POST /ingest/spans is enabled.
+func NewServer(engine *metrics.Engine, store storage.Store, addr string, baselineWindows int, apdexT int, detector *alerts.Detector, checker *health.Checker) *Server {
 	if apdexT <= 0 {
 		apdexT = 500
 	}
-	s := &Server{engine: engine, baselineWindows: baselineWindows, apdexT: apdexT, detector: detector, checker: checker}
+	s := &Server{engine: engine, store: store, baselineWindows: baselineWindows, apdexT: apdexT, detector: detector, checker: checker}
 	mux := http.NewServeMux()
 	sub, _ := fs.Sub(dashboardFS, "dashboard")
 	mux.Handle("/static/", http.FileServer(http.FS(sub)))
@@ -68,6 +71,9 @@ func NewServer(engine *metrics.Engine, addr string, baselineWindows int, apdexT 
 	mux.HandleFunc("/metrics/errors/fingerprints", s.handleErrorFingerprints)
 	mux.HandleFunc("/metrics/heatmap", s.handleHeatmap)
 	mux.HandleFunc("/metrics/anomaly-scores", s.handleAnomalyScores)
+	mux.HandleFunc("/traces", s.handleTraces)
+	mux.HandleFunc("/traces/", s.handleTraceDetail)
+	mux.HandleFunc("/ingest/spans", s.handleIngestSpans)
 	s.srv = &http.Server{Addr: addr, Handler: mux}
 	return s
 }
@@ -807,4 +813,194 @@ func (s *Server) handleAnomalyScores(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(scores) //nolint:errcheck
+}
+
+func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var (
+		summaries []metrics.TraceSummary
+		err       error
+	)
+	if raw := r.URL.Query().Get("window"); raw != "" {
+		win, parseErr := parseWindow(raw)
+		if parseErr != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid window %q: %v", raw, parseErr))
+			return
+		}
+		now := time.Now()
+		summaries, err = s.engine.TracesForRange(now.Add(-win), now)
+	} else {
+		summaries, err = s.engine.Traces()
+	}
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if summaries == nil {
+		summaries = []metrics.TraceSummary{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(summaries) //nolint:errcheck
+}
+
+// traceSpan is the unified span view used for waterfall rendering.
+type traceSpan struct {
+	SpanID       string            `json:"span_id"`
+	ParentSpanID string            `json:"parent_span_id"`
+	Name         string            `json:"name"`
+	Kind         string            `json:"kind"`        // proxy|controller|db|cache|event|view|rpc
+	StartMs      float64           `json:"start_ms"`    // offset from trace root start
+	DurationMs   float64           `json:"duration_ms"`
+	StatusCode   int               `json:"status_code"` // proxy spans only; 0 for inner spans
+	Attributes   map[string]string `json:"attributes"`
+	Status       string            `json:"status"`      // ok|error
+}
+
+// traceDetailResponse is the response for GET /traces/{traceID}.
+type traceDetailResponse struct {
+	TraceID string       `json:"trace_id"`
+	TotalMs float64      `json:"total_ms"`
+	Spans   []traceSpan  `json:"spans"`
+}
+
+func (s *Server) handleTraceDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	traceID := strings.TrimPrefix(r.URL.Path, "/traces/")
+	if traceID == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing trace_id")
+		return
+	}
+
+	proxyRecords, err := s.engine.TraceSpans(traceID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	innerSpans, err := s.engine.InnerSpans(traceID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Find the earliest start time across all spans to compute offsets.
+	var root time.Time
+	for i, rec := range proxyRecords {
+		if i == 0 || rec.Timestamp.Before(root) {
+			root = rec.Timestamp
+		}
+	}
+	for _, sp := range innerSpans {
+		if root.IsZero() || sp.StartTime.Before(root) {
+			root = sp.StartTime
+		}
+	}
+	if root.IsZero() {
+		root = time.Now()
+	}
+
+	spans := make([]traceSpan, 0, len(proxyRecords)+len(innerSpans))
+	var traceEnd time.Time
+
+	for _, rec := range proxyRecords {
+		startMs := float64(rec.Timestamp.Sub(root).Microseconds()) / 1000
+		end := rec.Timestamp.Add(time.Duration(rec.DurationMs * float64(time.Millisecond)))
+		if end.After(traceEnd) {
+			traceEnd = end
+		}
+		status := "ok"
+		if rec.StatusCode >= 400 {
+			status = "error"
+		}
+		spans = append(spans, traceSpan{
+			SpanID:       rec.SpanID,
+			ParentSpanID: rec.ParentSpanID,
+			Name:         rec.Method + " " + rec.Path,
+			Kind:         "proxy",
+			StartMs:      startMs,
+			DurationMs:   rec.DurationMs,
+			StatusCode:   rec.StatusCode,
+			Attributes:   map[string]string{},
+			Status:       status,
+		})
+	}
+	for _, sp := range innerSpans {
+		startMs := float64(sp.StartTime.Sub(root).Microseconds()) / 1000
+		end := sp.StartTime.Add(time.Duration(sp.DurationMs * float64(time.Millisecond)))
+		if end.After(traceEnd) {
+			traceEnd = end
+		}
+		attrs := sp.Attributes
+		if attrs == nil {
+			attrs = map[string]string{}
+		}
+		spans = append(spans, traceSpan{
+			SpanID:       sp.SpanID,
+			ParentSpanID: sp.ParentSpanID,
+			Name:         sp.Name,
+			Kind:         sp.Kind,
+			StartMs:      startMs,
+			DurationMs:   sp.DurationMs,
+			StatusCode:   0,
+			Attributes:   attrs,
+			Status:       sp.Status,
+		})
+	}
+
+	totalMs := float64(traceEnd.Sub(root).Microseconds()) / 1000
+	if totalMs < 0 {
+		totalMs = 0
+	}
+
+	resp := traceDetailResponse{
+		TraceID: traceID,
+		TotalMs: totalMs,
+		Spans:   spans,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp) //nolint:errcheck
+}
+
+func (s *Server) handleIngestSpans(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.store == nil {
+		http.Error(w, "ingest not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var spans []storage.InnerSpan
+	if err := json.NewDecoder(r.Body).Decode(&spans); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
+		return
+	}
+
+	for i := range spans {
+		if spans[i].TraceID == "" || spans[i].SpanID == "" {
+			writeJSONError(w, http.StatusBadRequest, "each span must have trace_id and span_id")
+			return
+		}
+		if spans[i].Status == "" {
+			spans[i].Status = "ok"
+		}
+		if spans[i].StartTime.IsZero() {
+			spans[i].StartTime = time.Now()
+		}
+		if err := s.store.SaveSpan(spans[i]); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	fmt.Fprintf(w, `{"accepted":%d}`, len(spans))
 }

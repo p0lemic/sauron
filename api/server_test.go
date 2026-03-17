@@ -35,11 +35,28 @@ func (r *staticReader) FindRecent(_, _ time.Time, limit int) ([]storage.Record, 
 	return r.records, nil
 }
 
+func (r *staticReader) FindByTraceID(traceID string) ([]storage.Record, error) {
+	var out []storage.Record
+	for _, rec := range r.records {
+		if rec.TraceID == traceID {
+			out = append(out, rec)
+		}
+	}
+	if out == nil {
+		out = []storage.Record{}
+	}
+	return out, nil
+}
+
+func (r *staticReader) FindSpansByTraceID(_ string) ([]storage.InnerSpan, error) {
+	return []storage.InnerSpan{}, nil
+}
+
 func newTestServer(t *testing.T, records []storage.Record) *api.Server {
 	t.Helper()
 	engine := metrics.NewEngine(&staticReader{records: records}, time.Minute)
 	detector := alerts.NewDetector(engine, 3.0, 5)
-	srv := api.NewServer(engine, "localhost:0", 5, 500, detector, nil)
+	srv := api.NewServer(engine, nil, "localhost:0", 5, 500, detector, nil)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 	return srv
@@ -222,7 +239,7 @@ func TestAPIAlertsActiveWithData(t *testing.T) {
 	}, window)
 	detector := alerts.NewDetector(engine, 3.0, 5)
 	detector.Evaluate()
-	srv := api.NewServer(engine, "localhost:0", 5, 500, detector, nil)
+	srv := api.NewServer(engine, nil, "localhost:0", 5, 500, detector, nil)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
@@ -258,6 +275,23 @@ func (r *apiSplitReader) FindRecent(_ time.Time, _ time.Time, limit int) ([]stor
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (r *apiSplitReader) FindByTraceID(traceID string) ([]storage.Record, error) {
+	var out []storage.Record
+	for _, rec := range r.currentRecords {
+		if rec.TraceID == traceID {
+			out = append(out, rec)
+		}
+	}
+	if out == nil {
+		out = []storage.Record{}
+	}
+	return out, nil
+}
+
+func (r *apiSplitReader) FindSpansByTraceID(_ string) ([]storage.InnerSpan, error) {
+	return []storage.InnerSpan{}, nil
 }
 
 // TC-14: Content-Type is application/json.
@@ -828,7 +862,7 @@ func TestAPIAlertsHistoryWithData(t *testing.T) {
 	}, window)
 	detector := alerts.NewDetector(engine, 3.0, 5)
 	detector.Evaluate()
-	srv := api.NewServer(engine, "localhost:0", 5, 500, detector, nil)
+	srv := api.NewServer(engine, nil, "localhost:0", 5, 500, detector, nil)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
@@ -1129,7 +1163,7 @@ func TestHealthWithChecker(t *testing.T) {
 	checker := health.New("http://127.0.0.1:0", 10*time.Second, 5*time.Second, 3)
 	engine := metrics.NewEngine(&staticReader{}, time.Minute)
 	detector := alerts.NewDetector(engine, 3.0, 5)
-	srv := api.NewServer(engine, "localhost:0", 5, 500, detector, checker)
+	srv := api.NewServer(engine, nil, "localhost:0", 5, 500, detector, checker)
 	require.NoError(t, srv.Start())
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
@@ -1424,4 +1458,211 @@ func TestErrorFingerprintsInvalidStatusFilter(t *testing.T) {
 	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&errBody))
 	assert.Contains(t, errBody.Error, "invalid status filter")
+}
+
+// ── Traces APM endpoints ──────────────────────────────────────────────────────
+
+// TC-01: GET /traces with no data returns empty array.
+func TestTracesEmpty(t *testing.T) {
+	srv := newTestServer(t, nil)
+	resp, err := http.Get("http://" + srv.Addr() + "/traces")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	var traces []interface{}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&traces))
+	assert.Empty(t, traces)
+}
+
+// TC-02: GET /traces groups records by trace_id and returns summaries.
+func TestTracesGroupsByTraceID(t *testing.T) {
+	tid1 := "aabbccddeeff00112233445566778899"
+	tid2 := "11223344556677889900aabbccddeeff"
+	now := time.Now()
+	records := []storage.Record{
+		{Timestamp: now.Add(-50 * time.Second), Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 100, TraceID: tid1, SpanID: "s1"},
+		{Timestamp: now.Add(-40 * time.Second), Method: "GET", Path: "/b", StatusCode: 500, DurationMs: 50, TraceID: tid1, SpanID: "s2", ParentSpanID: "s1"},
+		{Timestamp: now.Add(-30 * time.Second), Method: "GET", Path: "/c", StatusCode: 200, DurationMs: 20, TraceID: tid2, SpanID: "s3"},
+	}
+	srv := newTestServer(t, records)
+	resp, err := http.Get("http://" + srv.Addr() + "/traces")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var summaries []map[string]interface{}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&summaries))
+	require.Len(t, summaries, 2)
+
+	// Find summary for tid1 (2 spans, has errors).
+	var s1 map[string]interface{}
+	for _, s := range summaries {
+		if s["trace_id"] == tid1 {
+			s1 = s
+		}
+	}
+	require.NotNil(t, s1)
+	assert.Equal(t, float64(2), s1["span_count"])
+	assert.Equal(t, true, s1["has_errors"])
+}
+
+// TC-03: GET /traces/{traceID} returns a unified detail object with proxy spans ordered by timestamp ASC.
+func TestTraceDetail(t *testing.T) {
+	tid := "aabbccddeeff00112233445566778899"
+	now := time.Now()
+	records := []storage.Record{
+		{Timestamp: now.Add(-20 * time.Second), Method: "GET", Path: "/first", StatusCode: 200, DurationMs: 5, TraceID: tid, SpanID: "s1", ParentSpanID: ""},
+		{Timestamp: now.Add(-10 * time.Second), Method: "GET", Path: "/second", StatusCode: 200, DurationMs: 3, TraceID: tid, SpanID: "s2", ParentSpanID: "s1"},
+	}
+	srv := newTestServer(t, records)
+	resp, err := http.Get("http://" + srv.Addr() + "/traces/" + tid)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var detail map[string]interface{}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&detail))
+	assert.Equal(t, tid, detail["trace_id"])
+	spans := detail["spans"].([]interface{})
+	require.Len(t, spans, 2)
+	s0 := spans[0].(map[string]interface{})
+	s1 := spans[1].(map[string]interface{})
+	assert.Equal(t, "GET /first", s0["name"])
+	assert.Equal(t, "GET /second", s1["name"])
+	assert.Equal(t, "s1", s1["parent_span_id"])
+	assert.Equal(t, "proxy", s0["kind"])
+}
+
+// TC-04: GET /traces/{unknownID} returns an empty spans array (not 404).
+func TestTraceDetailUnknown(t *testing.T) {
+	srv := newTestServer(t, nil)
+	resp, err := http.Get("http://" + srv.Addr() + "/traces/deadbeefdeadbeefdeadbeefdeadbeef")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	var detail map[string]interface{}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&detail))
+	spans := detail["spans"].([]interface{})
+	assert.Empty(t, spans)
+}
+
+// ── US-51: POST /ingest/spans ─────────────────────────────────────────────────
+
+// newTestServerWithStore creates a server backed by an in-memory SQLite StoreReader.
+// Returns both the server and the store (for post-assertion reads).
+func newTestServerWithStore(t *testing.T) (*api.Server, storage.StoreReader) {
+	t.Helper()
+	sr, err := storage.Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	engine := metrics.NewEngine(sr, time.Minute)
+	detector := alerts.NewDetector(engine, 3.0, 5)
+	srv := api.NewServer(engine, sr, "localhost:0", 5, 500, detector, nil)
+	require.NoError(t, srv.Start())
+	t.Cleanup(func() {
+		srv.Shutdown(context.Background()) //nolint:errcheck
+		sr.Close()
+	})
+	return srv, sr
+}
+
+func postSpans(t *testing.T, addr, body string) *http.Response {
+	t.Helper()
+	resp, err := http.Post("http://"+addr+"/ingest/spans", "application/json", strings.NewReader(body))
+	require.NoError(t, err)
+	return resp
+}
+
+// TC-01: POST /ingest/spans with empty array → 202 {"accepted":0}.
+func TestIngestSpansEmpty(t *testing.T) {
+	srv, _ := newTestServerWithStore(t)
+	resp := postSpans(t, srv.Addr(), `[]`)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	var result map[string]int
+	require.NoError(t, json.Unmarshal(body, &result))
+	assert.Equal(t, 0, result["accepted"])
+}
+
+// TC-02: POST /ingest/spans one valid span → 202 accepted=1; span is persisted.
+func TestIngestSpansSingleSpan(t *testing.T) {
+	srv, sr := newTestServerWithStore(t)
+	traceID := "4bf92f3577b34da6a3ce929d0e0e4736"
+	body := `[{
+		"trace_id":       "` + traceID + `",
+		"span_id":        "a2fb4a1d1a96d312",
+		"parent_span_id": "00f067aa0ba902b7",
+		"name":           "App\\Controller\\UserController::index",
+		"kind":           "controller",
+		"start_time":     "2026-03-17T10:00:00.123456Z",
+		"duration_ms":    42.3,
+		"attributes":     {"http.method":"GET"},
+		"status":         "ok"
+	}]`
+	resp := postSpans(t, srv.Addr(), body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var result map[string]int
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	assert.Equal(t, 1, result["accepted"])
+
+	spans, err := sr.FindSpansByTraceID(traceID)
+	require.NoError(t, err)
+	require.Len(t, spans, 1)
+	assert.Equal(t, "a2fb4a1d1a96d312", spans[0].SpanID)
+	assert.Equal(t, "controller", spans[0].Kind)
+}
+
+// TC-03: POST /ingest/spans batch of 3 spans → 202 accepted=3.
+func TestIngestSpansBatch(t *testing.T) {
+	srv, _ := newTestServerWithStore(t)
+	body := `[
+		{"trace_id":"trace0001","span_id":"span0001","name":"a","kind":"controller","status":"ok"},
+		{"trace_id":"trace0002","span_id":"span0002","name":"b","kind":"db","status":"ok"},
+		{"trace_id":"trace0003","span_id":"span0003","name":"c","kind":"controller","status":"ok"}
+	]`
+	resp := postSpans(t, srv.Addr(), body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var result map[string]int
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	assert.Equal(t, 3, result["accepted"])
+}
+
+// TC-04: POST /ingest/spans span missing trace_id → 400.
+func TestIngestSpansMissingTraceID(t *testing.T) {
+	srv, _ := newTestServerWithStore(t)
+	resp := postSpans(t, srv.Addr(), `[{"span_id":"abc1234567890123"}]`)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), "each span must have trace_id and span_id")
+}
+
+// TC-05: POST /ingest/spans span missing span_id → 400.
+func TestIngestSpansMissingSpanID(t *testing.T) {
+	srv, _ := newTestServerWithStore(t)
+	resp := postSpans(t, srv.Addr(), `[{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}]`)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), "each span must have trace_id and span_id")
+}
+
+// TC-06: POST /ingest/spans invalid JSON body → 400 with "invalid JSON".
+func TestIngestSpansInvalidJSON(t *testing.T) {
+	srv, _ := newTestServerWithStore(t)
+	resp := postSpans(t, srv.Addr(), `{bad json}`)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), "invalid JSON")
+}
+
+// TC-07: POST /ingest/spans when store is nil → 503.
+func TestIngestSpansStoreNil(t *testing.T) {
+	srv := newTestServer(t, nil) // store=nil
+	resp := postSpans(t, srv.Addr(), `[{"trace_id":"t1","span_id":"s1","name":"x","kind":"controller"}]`)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }

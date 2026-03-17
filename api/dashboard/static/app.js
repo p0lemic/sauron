@@ -998,6 +998,230 @@ function fmtDuration(ms) {
   return `${h}h ${rm}m`;
 }
 
+// ── Traces (APM waterfall) ────────────────────────────────────────────────────
+let _selectedTraceID = null;
+let _traceList = [];   // last fetched summaries, kept for re-render after refresh
+
+async function fetchTraces() {
+  try {
+    const rp  = rangeParams();
+    const res = await fetch('/traces' + (rp || ''));
+    if (!res.ok) return;
+    _traceList = await res.json();
+    renderTraceList(_traceList);
+    // If a trace was previously selected and it still exists, keep its spans open.
+    if (_selectedTraceID && _traceList.some(t => t.trace_id === _selectedTraceID)) {
+      expandTrace(_selectedTraceID);
+    } else {
+      _selectedTraceID = null;
+    }
+  } catch (_) {}
+}
+
+function renderTraceList(traces) {
+  const list = el('traces-list');
+  if (!list) return;
+
+  if (!traces || traces.length === 0) {
+    list.innerHTML = '<div class="placeholder">No traces in this window</div>';
+    return;
+  }
+
+  const rows = traces.map(t => {
+    const tid    = escHtml(t.trace_id);
+    const short  = tid.slice(0, 8) + '…' + tid.slice(-4);
+    const dur    = fmt(t.total_duration_ms, 1);
+    const errCls = t.has_errors ? 'danger' : 'cell-dim';
+    const errTxt = t.has_errors ? '✕ error' : '✓ ok';
+    const ts     = new Date(t.start_time).toLocaleTimeString();
+    const open   = _selectedTraceID === t.trace_id;
+    const chevron = open ? '▾' : '▸';
+    return `<tr class="trace-row${open ? ' trace-row-active' : ''}" data-traceid="${tid}" style="cursor:pointer">
+      <td><span class="trace-chevron">${chevron}</span> <span class="trace-id" title="${tid}">${short}</span></td>
+      <td class="cell-time">${ts}</td>
+      <td>${dur}<span class="cell-unit">ms</span></td>
+      <td>${t.span_count}</td>
+      <td><span class="${errCls}">${errTxt}</span></td>
+    </tr>
+    <tr class="trace-spans-row" data-traceid="${tid}" style="display:${open ? '' : 'none'}">
+      <td colspan="5" class="trace-spans-cell">
+        <div class="wf-loading" id="wf-${tid}"><span class="cell-dim">loading…</span></div>
+      </td>
+    </tr>`;
+  }).join('');
+
+  list.innerHTML = `
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr>
+          <th></th><th>Trace ID</th><th>Start</th><th>Duration</th><th>Spans</th><th>Status</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+
+  // Fix: the first <th> is for the chevron column
+  // Rewrite thead with correct 5 cols (chevron+id merged)
+  const thead = list.querySelector('thead tr');
+  if (thead) {
+    thead.innerHTML = '<th>Trace ID</th><th>Start</th><th>Duration</th><th>Spans</th><th>Status</th>';
+  }
+
+  list.querySelectorAll('.trace-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const tid = row.dataset.traceid;
+      if (_selectedTraceID === tid) {
+        collapseTrace(tid);
+        _selectedTraceID = null;
+      } else {
+        if (_selectedTraceID) collapseTrace(_selectedTraceID);
+        _selectedTraceID = tid;
+        expandTrace(tid);
+      }
+    });
+  });
+}
+
+function collapseTrace(tid) {
+  const list = el('traces-list');
+  if (!list) return;
+  list.querySelectorAll(`.trace-row[data-traceid="${CSS.escape(tid)}"]`).forEach(r => {
+    r.classList.remove('trace-row-active');
+    r.querySelector('.trace-chevron').textContent = '▸';
+  });
+  list.querySelectorAll(`.trace-spans-row[data-traceid="${CSS.escape(tid)}"]`).forEach(r => {
+    r.style.display = 'none';
+  });
+}
+
+function expandTrace(tid) {
+  const list = el('traces-list');
+  if (!list) return;
+  list.querySelectorAll(`.trace-row[data-traceid="${CSS.escape(tid)}"]`).forEach(r => {
+    r.classList.add('trace-row-active');
+    r.querySelector('.trace-chevron').textContent = '▾';
+  });
+  list.querySelectorAll(`.trace-spans-row[data-traceid="${CSS.escape(tid)}"]`).forEach(r => {
+    r.style.display = '';
+  });
+  fetchTraceDetail(tid);
+}
+
+// kind → CSS class for the waterfall bar color
+const KIND_COLORS = {
+  proxy:      'wf-bar-proxy',
+  controller: 'wf-bar-controller',
+  db:         'wf-bar-db',
+  cache:      'wf-bar-cache',
+  event:      'wf-bar-event',
+  view:       'wf-bar-view',
+  rpc:        'wf-bar-rpc',
+};
+
+// kind → short display label
+const KIND_LABELS = {
+  proxy:      'HTTP',
+  controller: 'ctrl',
+  db:         'DB',
+  cache:      'cache',
+  event:      'event',
+  view:       'view',
+  rpc:        'RPC',
+};
+
+async function fetchTraceDetail(traceID) {
+  const wfEl = el('wf-' + traceID);
+  if (!wfEl) return;
+  try {
+    const res = await fetch('/traces/' + encodeURIComponent(traceID));
+    if (!res.ok) return;
+    const detail = await res.json();
+    renderWaterfall(detail, wfEl);
+  } catch (_) {}
+}
+
+function renderWaterfall(detail, container) {
+  // Support both new {trace_id, total_ms, spans:[]} and legacy []
+  const spans  = Array.isArray(detail) ? detail : (detail.spans || []);
+  const totalMs = Array.isArray(detail) ? null : detail.total_ms;
+
+  if (!spans || spans.length === 0) {
+    container.innerHTML = '<div class="wf-loading"><span class="cell-dim">No spans found</span></div>';
+    return;
+  }
+
+  // Build depth map for indentation from parent_span_id chain.
+  const depthMap = {};
+  function spanDepth(s) {
+    if (depthMap[s.span_id] !== undefined) return depthMap[s.span_id];
+    if (!s.parent_span_id) return (depthMap[s.span_id] = 0);
+    const parent = spans.find(p => p.span_id === s.parent_span_id);
+    return (depthMap[s.span_id] = parent ? spanDepth(parent) + 1 : 0);
+  }
+  spans.forEach(s => spanDepth(s));
+
+  // total duration: prefer server-provided, else compute from start_ms + duration_ms
+  const total = totalMs != null
+    ? totalMs
+    : Math.max(...spans.map(s => (s.start_ms || 0) + s.duration_ms)) || 1;
+
+  const bars = spans.map(s => {
+    const d       = depthMap[s.span_id] || 0;
+    const indent  = d * 16;
+    const left    = ((s.start_ms || 0) / (total || 1) * 100).toFixed(2);
+    const width   = Math.max((s.duration_ms / (total || 1) * 100), 0.4).toFixed(2);
+
+    const kind    = s.kind || 'proxy';
+    const barCls  = s.status === 'error' ? 'wf-bar-error'
+                  : (KIND_COLORS[kind] || 'wf-bar-proxy');
+    const kindLbl = KIND_LABELS[kind] || kind;
+
+    // Label line: for proxy spans show method+path+status, for inner spans show name+kind+duration
+    let labelHtml;
+    if (kind === 'proxy') {
+      const parts  = (s.name || '').split(' ');
+      const method = parts[0] || '';
+      const path   = parts.slice(1).join(' ') || '';
+      const stCls  = s.status_code >= 500 ? 'danger' : s.status_code >= 400 ? 'warning' : 'cell-dim';
+      labelHtml = `<span class="wf-kind-badge wf-kind-proxy">${kindLbl}</span>
+        <span class="wf-method">${escHtml(method)}</span>
+        <span class="wf-path">${escHtml(path)}</span>
+        <span class="wf-meta ${stCls}">${s.status_code} · ${fmt(s.duration_ms, 1)}ms</span>`;
+    } else {
+      const errMeta = s.status === 'error' ? ' <span class="danger">err</span>' : '';
+      // Show first DB attribute inline (e.g. db.query truncated)
+      const attrs   = s.attributes || {};
+      const snippet = attrs['db.query'] || attrs['cache.key'] || attrs['http.url'] || '';
+      const snipHtml = snippet
+        ? `<span class="wf-attr-snippet" title="${escHtml(snippet)}">${escHtml(snippet.slice(0, 60))}${snippet.length > 60 ? '…' : ''}</span>`
+        : '';
+      labelHtml = `<span class="wf-kind-badge wf-kind-${escHtml(kind)}">${escHtml(kindLbl)}</span>
+        <span class="wf-path">${escHtml(s.name)}</span>
+        ${snipHtml}
+        <span class="wf-meta cell-dim">${fmt(s.duration_ms, 1)}ms${errMeta}</span>`;
+    }
+
+    const tooltip = `${escHtml(s.name)} [${escHtml(kind)}] — ${fmt(s.duration_ms, 1)}ms`;
+    return `<div class="wf-row">
+      <div class="wf-label" style="padding-left:${indent}px">${labelHtml}</div>
+      <div class="wf-track" title="${tooltip}">
+        <div class="wf-bar ${barCls}" style="left:${left}%;width:${width}%"></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  const halfMs = fmt(total / 2, 0);
+  const totStr = fmt(total, 1);
+  container.innerHTML = `
+    <div class="wf-header">
+      <span class="wf-total">${spans.length} span${spans.length !== 1 ? 's' : ''} · ${totStr}ms total</span>
+      <div class="wf-time-axis">
+        <span>0ms</span><span>${halfMs}ms</span><span>${totStr}ms</span>
+      </div>
+    </div>
+    <div class="wf-container">${bars}</div>`;
+}
+
 async function refresh() {
   await Promise.all([
     fetchHeatmap(),
@@ -1005,6 +1229,7 @@ async function refresh() {
     fetchApdex(), fetchAnomalyScores(), fetchErrorFingerprints(),
     fetchAlerts(), fetchAlertHistory(),
     fetchSlowestRequests(), fetchRequests(), fetchHealth(),
+    fetchTraces(),
   ]);
 }
 

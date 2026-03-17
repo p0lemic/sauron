@@ -30,8 +30,9 @@ func (s *capturingStore) Save(r storage.Record) error {
 	s.mu.Unlock()
 	return nil
 }
-func (s *capturingStore) Prune(_ time.Time) (int64, error) { return 0, nil }
-func (s *capturingStore) Close() error                     { return nil }
+func (s *capturingStore) SaveSpan(_ storage.InnerSpan) error { return nil }
+func (s *capturingStore) Prune(_ time.Time) (int64, error)  { return 0, nil }
+func (s *capturingStore) Close() error                      { return nil }
 
 func (s *capturingStore) all() []storage.Record {
 	s.mu.Lock()
@@ -958,4 +959,31 @@ func TestTraceContextDisabled(t *testing.T) {
 	require.Len(t, records, 1)
 	assert.Empty(t, records[0].TraceID)
 	assert.Empty(t, records[0].SpanID)
+}
+
+// TC-11: Request with existing traceparent → proxy preserves trace_id and records parent_span_id.
+func TestTraceContextPreservesParentSpanID(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	h, store := newHandlerWithTraceContext(t, upstreamURL, true)
+
+	const traceID   = "4bf92f3577b34da6a3ce929d0e0e4736"
+	const parentID  = "00f067aa0ba902b7"
+	const traceparent = "00-" + traceID + "-" + parentID + "-01"
+
+	req := httptest.NewRequest("GET", "/x", nil)
+	req.Header.Set("Traceparent", traceparent)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	time.Sleep(50 * time.Millisecond)
+	records := store.all()
+	require.Len(t, records, 1)
+	assert.Equal(t, traceID, records[0].TraceID)
+	assert.Equal(t, parentID, records[0].ParentSpanID)
+	assert.Len(t, records[0].SpanID, 16)
 }

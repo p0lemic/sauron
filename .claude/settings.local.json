@@ -27,7 +27,11 @@
       "Bash(which watchexec:*)",
       "Bash(mkdir:*)",
       "Bash(make build:*)",
-      "Bash(git stash:*)"
+      "Bash(git stash:*)",
+      "Bash(cd:*)",
+      "Bash(./vendor/bin/phpunit 2>&1)",
+      "Bash(composer dump-autoload:*)",
+      "Bash(find:*)"
     ]
   }
 }

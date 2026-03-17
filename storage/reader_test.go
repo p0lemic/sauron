@@ -165,3 +165,47 @@ func TestFindByWindowFieldsPreserved(t *testing.T) {
 	assert.Equal(t, 201, r.StatusCode)
 	assert.InDelta(t, 42.5, r.DurationMs, 0.001)
 }
+
+// TestFindByTraceID verifies that FindByTraceID returns only the records with
+// the requested trace_id, ordered by timestamp ascending.
+func TestFindByTraceID(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	tid := "aabbccddeeff00112233445566778899"
+
+	// Three records with the target trace_id, inserted out of order.
+	require.NoError(t, s.Save(Record{Timestamp: now.Add(-10 * time.Second), Method: "GET", Path: "/b", StatusCode: 200, DurationMs: 5, TraceID: tid, SpanID: "span2", ParentSpanID: "span1"}))
+	require.NoError(t, s.Save(Record{Timestamp: now.Add(-20 * time.Second), Method: "GET", Path: "/a", StatusCode: 200, DurationMs: 10, TraceID: tid, SpanID: "span1", ParentSpanID: ""}))
+	require.NoError(t, s.Save(Record{Timestamp: now.Add(-5 * time.Second), Method: "GET", Path: "/c", StatusCode: 500, DurationMs: 3, TraceID: tid, SpanID: "span3", ParentSpanID: "span2"}))
+	// One record with a different trace_id — must not appear.
+	require.NoError(t, s.Save(Record{Timestamp: now, Method: "GET", Path: "/other", StatusCode: 200, DurationMs: 1, TraceID: "othertraceidothertraceidothertrace", SpanID: "spanX"}))
+
+	recs, err := s.FindByTraceID(tid)
+	require.NoError(t, err)
+	require.Len(t, recs, 3)
+
+	// Must be ordered by timestamp ASC.
+	assert.Equal(t, "/a", recs[0].Path)
+	assert.Equal(t, "/b", recs[1].Path)
+	assert.Equal(t, "/c", recs[2].Path)
+
+	// ParentSpanID must be round-tripped correctly.
+	assert.Equal(t, "", recs[0].ParentSpanID)
+	assert.Equal(t, "span1", recs[1].ParentSpanID)
+	assert.Equal(t, "span2", recs[2].ParentSpanID)
+}
+
+// TestFindByTraceIDEmpty verifies an empty slice (not nil) when no records match.
+func TestFindByTraceIDEmpty(t *testing.T) {
+	s, err := Open("sqlite", ":memory:")
+	require.NoError(t, err)
+	defer s.Close()
+
+	recs, err := s.FindByTraceID("nonexistenttraceidnonexistentxxx")
+	require.NoError(t, err)
+	assert.NotNil(t, recs)
+	assert.Empty(t, recs)
+}

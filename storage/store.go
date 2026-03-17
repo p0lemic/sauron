@@ -11,18 +11,21 @@ import (
 
 // Record represents the metadata of a single proxied request.
 type Record struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Method     string    `json:"method"`
-	Path       string    `json:"path"`
-	StatusCode int       `json:"status_code"`
-	DurationMs float64   `json:"duration_ms"`
-	TraceID    string    `json:"trace_id"`
-	SpanID     string    `json:"span_id"`
+	Timestamp    time.Time `json:"timestamp"`
+	Method       string    `json:"method"`
+	Path         string    `json:"path"`
+	StatusCode   int       `json:"status_code"`
+	DurationMs   float64   `json:"duration_ms"`
+	TraceID      string    `json:"trace_id"`
+	SpanID       string    `json:"span_id"`
+	ParentSpanID string    `json:"parent_span_id"`
 }
 
-// Store persists request records.
+// Store persists request records and inner spans.
 type Store interface {
 	Save(r Record) error
+	// SaveSpan persists an application-level inner span.
+	SaveSpan(s InnerSpan) error
 	// Prune deletes all records with timestamp strictly before before.
 	// Returns the number of rows deleted.
 	Prune(before time.Time) (int64, error)
@@ -74,6 +77,30 @@ func migrate(db *sql.DB) error {
 	if err := sqliteAddColumnIfNotExists(db, "requests", "span_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := sqliteAddColumnIfNotExists(db, "requests", "parent_span_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_trace_id ON requests (trace_id)`); err != nil {
+		return err
+	}
+	// spans table for inner (application-level) spans
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS spans (
+		id            INTEGER  PRIMARY KEY AUTOINCREMENT,
+		trace_id      TEXT     NOT NULL,
+		span_id       TEXT     NOT NULL,
+		parent_span_id TEXT    NOT NULL DEFAULT '',
+		name          TEXT     NOT NULL,
+		kind          TEXT     NOT NULL DEFAULT '',
+		start_time    DATETIME NOT NULL,
+		duration_ms   REAL     NOT NULL,
+		attributes    TEXT     NOT NULL DEFAULT '{}',
+		status        TEXT     NOT NULL DEFAULT 'ok'
+	)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_spans_trace_id ON spans (trace_id)`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -89,8 +116,8 @@ func sqliteAddColumnIfNotExists(db *sql.DB, table, column, def string) error {
 
 func (s *sqliteStore) Save(r Record) error {
 	_, err := s.db.Exec(
-		`INSERT INTO requests (timestamp, method, path, status_code, duration_ms, trace_id, span_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO requests (timestamp, method, path, status_code, duration_ms, trace_id, span_id, parent_span_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.Timestamp.UTC().Format(time.RFC3339Nano),
 		r.Method,
 		r.Path,
@@ -98,9 +125,30 @@ func (s *sqliteStore) Save(r Record) error {
 		r.DurationMs,
 		r.TraceID,
 		r.SpanID,
+		r.ParentSpanID,
 	)
 	if err != nil {
 		return fmt.Errorf("storage: insert: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) SaveSpan(sp InnerSpan) error {
+	_, err := s.db.Exec(
+		`INSERT INTO spans (trace_id, span_id, parent_span_id, name, kind, start_time, duration_ms, attributes, status)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sp.TraceID,
+		sp.SpanID,
+		sp.ParentSpanID,
+		sp.Name,
+		sp.Kind,
+		sp.StartTime.UTC().Format(time.RFC3339Nano),
+		sp.DurationMs,
+		encodeAttrs(sp.Attributes),
+		sp.Status,
+	)
+	if err != nil {
+		return fmt.Errorf("storage: SaveSpan: %w", err)
 	}
 	return nil
 }
