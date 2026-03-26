@@ -7,6 +7,7 @@ namespace Sauron\Bundle\DependencyInjection;
 use Sauron\Bundle\Doctrine\SauronMiddleware;
 use Sauron\Bundle\EventSubscriber\TraceSubscriber;
 use Sauron\Bundle\SauronClient;
+use Sauron\Bundle\SauronTracer;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Definition;
 use Symfony\Component\DependencyInjection\Extension\Extension;
@@ -32,9 +33,16 @@ class SauronExtension extends Extension
         $client->setPublic(false);
         $container->setDefinition(SauronClient::class, $client);
 
-        // TraceSubscriber — creates controller spans
+        // SauronTracer — developer-facing API for manual span instrumentation
+        $tracer = new Definition(SauronTracer::class, [new Reference(SauronClient::class)]);
+        $tracer->setPublic(true);   // allow autowiring in controllers and services
+        $container->setDefinition(SauronTracer::class, $tracer);
+
+        // TraceSubscriber — creates controller, routing, and view spans
         $subscriber = new Definition(TraceSubscriber::class, [
             new Reference(SauronClient::class),
+            $config['instrument_routing'],
+            $config['instrument_view'],
         ]);
         $subscriber->addTag('kernel.event_subscriber');
         $container->setDefinition(TraceSubscriber::class, $subscriber);

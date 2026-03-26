@@ -1,4 +1,4 @@
-.PHONY: build run-proxy run-dashboard dev dev-proxy dev-dashboard test docker-build clean
+.PHONY: build run-proxy run-dashboard dev dev-proxy dev-dashboard test docker-build clean bundle-publish
 
 # ── Defaults (override via env or CLI) ────────────────────────────────────────
 UPSTREAM        ?= http://localhost:3000
@@ -65,6 +65,10 @@ docker-build:
 
 docker-push:
 	docker push $(IMAGE):$(TAG)
+
+# ── Bundle ────────────────────────────────────────────────────────────────────
+bundle-publish:
+	git subtree push --prefix=integrations/symfony-bundle bundle main
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
 clean:

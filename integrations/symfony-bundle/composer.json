@@ -18,8 +18,7 @@
   "autoload": {
     "psr-4": {
       "Sauron\\Bundle\\": "src/"
-    },
-    "classmap": ["src/Doctrine/SauronMiddleware.php"]
+    }
   },
   "autoload-dev": {
     "psr-4": {
@@ -28,7 +27,8 @@
   },
   "extra": {
     "symfony": {
-      "allow-contrib": false
+      "allow-contrib": false,
+      "require": "^6.0 || ^7.0"
     }
   }
 }
