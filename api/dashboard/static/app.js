@@ -159,12 +159,14 @@ async function fetchHeatmap() {
       return `<div class="hm-row"><div class="hm-day-label">${day}</div>${cells}</div>`;
     }).join('');
 
-    body.innerHTML = `<div class="hm-grid">${hourRow}${rows}</div>
+    body.innerHTML = `<div class="hm-wrap">
+      <div class="hm-grid">${hourRow}${rows}</div>
       <div class="hm-legend">
         <span class="hm-legend-label">0 ${unit}</span>
         <div class="hm-legend-bar" style="background:linear-gradient(90deg,transparent,${color})"></div>
         <span class="hm-legend-label">${data.max.toFixed(2)} ${unit}</span>
-      </div>`;
+      </div>
+    </div>`;
   } catch (_) {}
 }
 
@@ -734,7 +736,7 @@ function buildRequestRows(records) {
     const sc  = statusClass(r.status_code);
     const durCls = r.duration_ms >= 1000 ? 'danger' : '';
     const traceCell = r.trace_id
-      ? `<span class="trace-badge" title="${escHtml(r.trace_id)}">${escHtml(r.trace_id.slice(0, 8))}</span>`
+      ? `<span class="trace-badge trace-badge-link" title="Click to view trace" data-traceid="${escHtml(r.trace_id)}">${escHtml(r.trace_id.slice(0, 8))}</span>`
       : '<span class="cell-dim">—</span>';
     return `<tr>
       <td class="cell-time">${hms}.${ms}</td>
@@ -767,6 +769,12 @@ async function fetchSlowestRequests() {
           </table>
         </div>
       </div>`;
+    pane.querySelectorAll('.trace-badge-link').forEach(badge => {
+      badge.addEventListener('click', e => {
+        e.stopPropagation();
+        openTraceDrawer(badge.dataset.traceid);
+      });
+    });
   } catch (_) { /* keep last known state */ }
 }
 
@@ -858,6 +866,13 @@ function renderRequestLog() {
   el('rl-status').addEventListener('change', e => { _rlStatus = e.target.value; _rlPage = 0; renderRequestLog(); });
   el('rl-prev').addEventListener('click', () => { _rlPage--; renderRequestLog(); });
   el('rl-next').addEventListener('click', () => { _rlPage++; renderRequestLog(); });
+
+  body.querySelectorAll('.trace-badge-link').forEach(badge => {
+    badge.addEventListener('click', e => {
+      e.stopPropagation();
+      openTraceDrawer(badge.dataset.traceid);
+    });
+  });
 }
 
 async function fetchRequests() {
@@ -998,18 +1013,57 @@ function fmtDuration(ms) {
   return `${h}h ${rm}m`;
 }
 
+// ── Trace detail drawer ───────────────────────────────────────────────────────
+function openTraceDrawer(traceId) {
+  const overlay   = el('trace-drawer-overlay');
+  const drawer    = el('trace-drawer');
+  const body      = el('trace-drawer-body');
+  const shortId   = el('trace-drawer-id');
+  if (!overlay || !drawer || !body) return;
+
+  overlay.style.display = '';
+  drawer.style.display  = 'flex';
+  shortId.textContent   = traceId.slice(0, 8) + '…' + traceId.slice(-4);
+  body.innerHTML        = '<div class="wf-loading"><span class="cell-dim">loading…</span></div>';
+
+  fetch('/traces/' + encodeURIComponent(traceId))
+    .then(r => r.ok ? r.json() : null)
+    .then(detail => {
+      if (!detail) {
+        body.innerHTML = '<div class="wf-loading"><span class="cell-dim">No spans found</span></div>';
+        return;
+      }
+      renderWaterfall(detail, body);
+    })
+    .catch(() => {
+      body.innerHTML = '<div class="wf-loading"><span class="danger">Failed to load trace</span></div>';
+    });
+}
+
+function closeTraceDrawer() {
+  const overlay = el('trace-drawer-overlay');
+  const drawer  = el('trace-drawer');
+  if (overlay) overlay.style.display = 'none';
+  if (drawer)  drawer.style.display  = 'none';
+}
+
 // ── Traces (APM waterfall) ────────────────────────────────────────────────────
+const TL_PAGE_SIZE = 20;
 let _selectedTraceID = null;
-let _traceList = [];   // last fetched summaries, kept for re-render after refresh
+let _traceList = [];
+let _tlPage = 0;
 
 async function fetchTraces() {
   try {
     const rp  = rangeParams();
     const res = await fetch('/traces' + (rp || ''));
     if (!res.ok) return;
-    _traceList = await res.json();
-    renderTraceList(_traceList);
-    // If a trace was previously selected and it still exists, keep its spans open.
+    const fresh = await res.json();
+    if (JSON.stringify(fresh.map(t => t.trace_id)) !== JSON.stringify(_traceList.map(t => t.trace_id))) {
+      _tlPage = 0;
+    }
+    _traceList = fresh;
+    renderTraceList();
     if (_selectedTraceID && _traceList.some(t => t.trace_id === _selectedTraceID)) {
       expandTrace(_selectedTraceID);
     } else {
@@ -1018,16 +1072,25 @@ async function fetchTraces() {
   } catch (_) {}
 }
 
-function renderTraceList(traces) {
+function renderTraceList() {
   const list = el('traces-list');
   if (!list) return;
 
-  if (!traces || traces.length === 0) {
+  if (!_traceList || _traceList.length === 0) {
     list.innerHTML = '<div class="placeholder">No traces in this window</div>';
     return;
   }
 
-  const rows = traces.map(t => {
+  const totalPages = Math.max(1, Math.ceil(_traceList.length / TL_PAGE_SIZE));
+  if (_tlPage >= totalPages) _tlPage = totalPages - 1;
+
+  const start    = _tlPage * TL_PAGE_SIZE;
+  const pageData = _traceList.slice(start, start + TL_PAGE_SIZE);
+
+  const rangeStart = start + 1;
+  const rangeEnd   = Math.min(start + TL_PAGE_SIZE, _traceList.length);
+
+  const rows = pageData.map(t => {
     const tid    = escHtml(t.trace_id);
     const short  = tid.slice(0, 8) + '…' + tid.slice(-4);
     const dur    = fmt(t.total_duration_ms, 1);
@@ -1054,18 +1117,19 @@ function renderTraceList(traces) {
     <div class="table-wrap">
       <table class="data-table">
         <thead><tr>
-          <th></th><th>Trace ID</th><th>Start</th><th>Duration</th><th>Spans</th><th>Status</th>
+          <th>Trace ID</th><th>Start</th><th>Duration</th><th>Spans</th><th>Status</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
+    </div>
+    <div class="pagination">
+      <button class="page-btn" id="tl-prev" ${_tlPage === 0 ? 'disabled' : ''}>← Prev</button>
+      <span class="page-info">${rangeStart}–${rangeEnd} of ${_traceList.length}</span>
+      <button class="page-btn" id="tl-next" ${_tlPage >= totalPages - 1 ? 'disabled' : ''}>Next →</button>
     </div>`;
 
-  // Fix: the first <th> is for the chevron column
-  // Rewrite thead with correct 5 cols (chevron+id merged)
-  const thead = list.querySelector('thead tr');
-  if (thead) {
-    thead.innerHTML = '<th>Trace ID</th><th>Start</th><th>Duration</th><th>Spans</th><th>Status</th>';
-  }
+  el('tl-prev').addEventListener('click', () => { _tlPage--; renderTraceList(); });
+  el('tl-next').addEventListener('click', () => { _tlPage++; renderTraceList(); });
 
   list.querySelectorAll('.trace-row').forEach(row => {
     row.addEventListener('click', () => {
@@ -1116,6 +1180,10 @@ const KIND_COLORS = {
   event:      'wf-bar-event',
   view:       'wf-bar-view',
   rpc:        'wf-bar-rpc',
+  routing:    'wf-bar-routing',
+  boot:       'wf-bar-boot',
+  send:       'wf-bar-send',
+  custom:     'wf-bar-custom',
 };
 
 // kind → short display label
@@ -1127,6 +1195,10 @@ const KIND_LABELS = {
   event:      'event',
   view:       'view',
   rpc:        'RPC',
+  routing:    'route',
+  boot:       'BOOT',
+  send:       'SEND',
+  custom:     'SPAN',
 };
 
 async function fetchTraceDetail(traceID) {
@@ -1144,6 +1216,8 @@ function renderWaterfall(detail, container) {
   // Support both new {trace_id, total_ms, spans:[]} and legacy []
   const spans  = Array.isArray(detail) ? detail : (detail.spans || []);
   const totalMs = Array.isArray(detail) ? null : detail.total_ms;
+
+  spans.sort((a, b) => (a.start_ms || 0) - (b.start_ms || 0));
 
   if (!spans || spans.length === 0) {
     container.innerHTML = '<div class="wf-loading"><span class="cell-dim">No spans found</span></div>';
@@ -1165,7 +1239,7 @@ function renderWaterfall(detail, container) {
     ? totalMs
     : Math.max(...spans.map(s => (s.start_ms || 0) + s.duration_ms)) || 1;
 
-  const bars = spans.map(s => {
+  const bars = spans.map((s, i) => {
     const d       = depthMap[s.span_id] || 0;
     const indent  = d * 16;
     const left    = ((s.start_ms || 0) / (total || 1) * 100).toFixed(2);
@@ -1191,7 +1265,9 @@ function renderWaterfall(detail, container) {
       const errMeta = s.status === 'error' ? ' <span class="danger">err</span>' : '';
       // Show first DB attribute inline (e.g. db.query truncated)
       const attrs   = s.attributes || {};
-      const snippet = attrs['db.query'] || attrs['cache.key'] || attrs['http.url'] || '';
+      const phpVer   = attrs['php.version'] ? `PHP ${attrs['php.version']}` + (attrs['php.peak_memory'] ? ` · ${attrs['php.peak_memory']}` : '') : '';
+      const ctrlMeta = attrs['http.method'] ? `${attrs['http.method']}${attrs['http.route'] ? ' ' + attrs['http.route'] : ''}` : '';
+      const snippet  = attrs['db.query'] || attrs['cache.key'] || attrs['http.url'] || attrs['twig.template'] || phpVer || ctrlMeta || '';
       const snipHtml = snippet
         ? `<span class="wf-attr-snippet" title="${escHtml(snippet)}">${escHtml(snippet.slice(0, 60))}${snippet.length > 60 ? '…' : ''}</span>`
         : '';
@@ -1202,7 +1278,7 @@ function renderWaterfall(detail, container) {
     }
 
     const tooltip = `${escHtml(s.name)} [${escHtml(kind)}] — ${fmt(s.duration_ms, 1)}ms`;
-    return `<div class="wf-row">
+    return `<div class="wf-row" data-span-idx="${i}">
       <div class="wf-label" style="padding-left:${indent}px">${labelHtml}</div>
       <div class="wf-track" title="${tooltip}">
         <div class="wf-bar ${barCls}" style="left:${left}%;width:${width}%"></div>
@@ -1220,24 +1296,101 @@ function renderWaterfall(detail, container) {
       </div>
     </div>
     <div class="wf-container">${bars}</div>`;
+
+  // Attach click-to-expand for each span row.
+  container.querySelectorAll('.wf-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const existing = row.nextElementSibling;
+      if (existing && existing.classList.contains('wf-span-detail')) {
+        existing.remove();
+        return;
+      }
+      const idx = parseInt(row.dataset.spanIdx, 10);
+      const s   = spans[idx];
+      if (!s) return;
+
+      const attrs   = s.attributes || {};
+      const attrKeys = Object.keys(attrs);
+      const baseRows = [
+        ['name',     s.name],
+        ['kind',     s.kind || 'proxy'],
+        ['status',   s.status || 'ok'],
+        ['start',    `+${fmt(s.start_ms || 0, 2)}ms`],
+        ['duration', `${fmt(s.duration_ms, 2)}ms`],
+        ...(s.status_code ? [['http.status', String(s.status_code)]] : []),
+      ];
+      const allRows = [...baseRows, ...attrKeys.map(k => [k, attrs[k]])];
+      const rowsHtml = allRows.map(([k, v]) =>
+        `<tr><td>${escHtml(k)}</td><td>${escHtml(v)}</td></tr>`
+      ).join('');
+
+      const detail = document.createElement('div');
+      detail.className = 'wf-span-detail';
+      detail.innerHTML = `<table class="wf-span-detail-table"><tbody>${rowsHtml}</tbody></table>`;
+      row.after(detail);
+    });
+  });
 }
 
+// ── Router ────────────────────────────────────────────────────────────────────
+const PAGES = ['overview', 'endpoints', 'errors', 'requests', 'traces'];
+
+function currentPage() {
+  const h = location.hash.replace('#', '');
+  return PAGES.includes(h) ? h : 'overview';
+}
+
+function navigate(page) {
+  location.hash = page;
+}
+
+function showPage(page) {
+  document.querySelectorAll('section[data-page]').forEach(s => {
+    // sections with display:none managed by their own logic (alerts, alert-history)
+    // keep them hidden even if they're on the active page, unless they have data
+    if (s.dataset.page !== page) {
+      s.style.display = 'none';
+    } else {
+      // restore display only if the section wasn't intentionally hidden by data logic
+      // (alert-history and alerts manage their own display state)
+      const managed = s.id === 'alerts' || s.id === 'alert-history';
+      if (!managed) s.style.display = '';
+    }
+  });
+  document.querySelectorAll('.nav-item').forEach(b => {
+    b.classList.toggle('active', b.dataset.page === page);
+  });
+}
+
+const PAGE_FETCHES = {
+  overview:  () => Promise.all([fetchHeatmap(), fetchSummary(), fetchStatusBreakdown()]),
+  endpoints: () => Promise.all([fetchEndpoints(), fetchApdex(), fetchAnomalyScores()]),
+  errors:    () => Promise.all([fetchErrorFingerprints(), fetchAlerts(), fetchAlertHistory()]),
+  requests:  () => Promise.all([fetchRequests(), fetchSlowestRequests()]),
+  traces:    () => fetchTraces(),
+};
+
+window.addEventListener('hashchange', () => {
+  const page = currentPage();
+  showPage(page);
+  PAGE_FETCHES[page]?.();
+});
+
 async function refresh() {
-  await Promise.all([
-    fetchHeatmap(),
-    fetchSummary(), fetchStatusBreakdown(), fetchEndpoints(),
-    fetchApdex(), fetchAnomalyScores(), fetchErrorFingerprints(),
-    fetchAlerts(), fetchAlertHistory(),
-    fetchSlowestRequests(), fetchRequests(), fetchHealth(),
-    fetchTraces(),
-  ]);
+  fetchAlerts();   // always: keeps alert badge in header current
+  fetchHealth();   // always: keeps statusbar current
+  await PAGE_FETCHES[currentPage()]?.();
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 initTimeRange();
 initHeatmapTabs();
 initRequestsTabs();
-refresh();
+const _initialPage = currentPage();
+showPage(_initialPage);
+PAGE_FETCHES[_initialPage]?.();
+fetchAlerts();
+fetchHealth();
 startPolling();
 
 // ── Status bar clock ──────────────────────────────────────────────────────────

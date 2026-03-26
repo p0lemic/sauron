@@ -19,6 +19,24 @@
     </div>
   </header>
 
+  <nav class="sidebar">
+    <button class="nav-item active" data-page="overview"  onclick="navigate('overview')">
+      <span class="nav-icon">◈</span> Overview
+    </button>
+    <button class="nav-item" data-page="endpoints" onclick="navigate('endpoints')">
+      <span class="nav-icon">⊞</span> Endpoints
+    </button>
+    <button class="nav-item" data-page="errors"    onclick="navigate('errors')">
+      <span class="nav-icon">⚠</span> Errors
+    </button>
+    <button class="nav-item" data-page="requests"  onclick="navigate('requests')">
+      <span class="nav-icon">≡</span> Requests
+    </button>
+    <button class="nav-item" data-page="traces"    onclick="navigate('traces')">
+      <span class="nav-icon">◎</span> Traces
+    </button>
+  </nav>
+
   <div class="timerange-bar" id="timerange-bar">
     <div class="timerange-inner">
       <span class="timerange-label">Range</span>
@@ -42,7 +60,7 @@
 
   <main>
 
-    <section id="heatmap">
+    <section id="heatmap" data-page="overview">
       <div class="section-header">
         <span class="section-title"><span class="dot"></span>Traffic Heatmap</span>
         <div class="panel-tabs" id="heatmap-tabs">
@@ -55,7 +73,7 @@
       </div>
     </section>
 
-    <section id="summary">
+    <section id="summary" data-page="overview">
       <div class="section-header">
         <span class="section-title"><span class="dot"></span>Overview</span>
       </div>
@@ -64,7 +82,7 @@
       </div>
     </section>
 
-    <section id="status-breakdown">
+    <section id="status-breakdown" data-page="overview">
       <div class="section-header">
         <span class="section-title"><span class="dot"></span>Status</span>
       </div>
@@ -73,7 +91,7 @@
       </div>
     </section>
 
-    <section id="error-fingerprints">
+    <section id="error-fingerprints" data-page="errors">
       <div class="section-header">
         <span class="section-title"><span class="dot dot-warn"></span>Error Fingerprints</span>
       </div>
@@ -82,7 +100,7 @@
       </div>
     </section>
 
-    <section id="alert-history" style="display:none">
+    <section id="alert-history" data-page="errors" style="display:none">
       <div class="section-header">
         <span class="section-title"><span class="dot dot-warn"></span>Alert History</span>
         <div class="panel-tabs" id="ah-kind-tabs"></div>
@@ -90,14 +108,14 @@
       <div class="section-body"></div>
     </section>
 
-    <section id="alerts" style="display:none">
+    <section id="alerts" data-page="errors" style="display:none">
       <div class="section-header">
         <span class="section-title"><span class="dot dot-danger"></span>Active Alerts</span>
       </div>
       <div class="section-body"></div>
     </section>
 
-    <section id="endpoints">
+    <section id="endpoints" data-page="endpoints">
       <div class="section-header">
         <span class="section-title"><span class="dot"></span>Endpoints</span>
       </div>
@@ -106,7 +124,7 @@
       </div>
     </section>
 
-    <section id="requests-section">
+    <section id="requests-section" data-page="requests">
       <div class="section-header">
         <span class="section-title"><span class="dot"></span>Requests</span>
         <div class="panel-tabs" id="requests-tabs">
@@ -122,7 +140,7 @@
       </div>
     </section>
 
-    <section id="traces-section">
+    <section id="traces-section" data-page="traces">
       <div class="section-header">
         <span class="section-title"><span class="dot"></span>Traces</span>
       </div>
@@ -132,6 +150,18 @@
     </section>
 
   </main>
+
+  <!-- Trace detail drawer -->
+  <div id="trace-drawer-overlay" class="drawer-overlay" style="display:none" onclick="closeTraceDrawer()"></div>
+  <aside id="trace-drawer" class="trace-drawer" style="display:none">
+    <div class="trace-drawer-header">
+      <span class="trace-drawer-title">Trace <span id="trace-drawer-id" class="font-mono"></span></span>
+      <button class="trace-drawer-close" onclick="closeTraceDrawer()">✕</button>
+    </div>
+    <div id="trace-drawer-body" class="trace-drawer-body">
+      <span class="cell-dim">loading…</span>
+    </div>
+  </aside>
 
   <div class="statusbar">
     <div class="statusbar-item">
